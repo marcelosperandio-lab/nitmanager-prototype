@@ -1,0 +1,15 @@
+{
+  "name": "nit-web-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Protótipo navegável do aplicativo do Núcleo de Inovação Tecnológica.",
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 4173",
+    "serve": "python3 -m http.server 4173"
+  },
+  "futureReactMigration": {
+    "intendedStack": "Vite + React + TypeScript",
+    "note": "Este MVP inicial é estático para rodar sem instalação de dependências neste ambiente. A estrutura de componentes/dados foi mantida modular para migração direta."
+  }
+}
