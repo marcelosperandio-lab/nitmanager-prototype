@@ -12,18 +12,58 @@ import {
 } from './data.js';
 
 const state = {
+  userList: [],
   currentUserId: 'usr-paulo',
   route: 'dashboard',
   selectedProcessId: processes[0].id,
   searchTerm: '',
   searchDraft: '',
   activeSearchBox: '',
+  mfaVerified: false,
+  sessionLocked: false,
+  lockReason: '',
+  pendingMfaCode: '',
+  mfaCodeIssuedAt: '',
+  lastActivityAt: Date.now(),
   processList: [],
   pendencyList: [],
   messageList: [],
   documentList: [],
   aaciimList: [],
   historyList: [],
+  incidentList: [],
+  auditList: [],
+  notificationList: [],
+  replyToMessageId: '',
+  composeMessageWarning: '',
+  replyWarning: '',
+  documentUploadWarning: '',
+  composeSensitiveOverrideReady: false,
+  replySensitiveOverrideReady: false,
+  documentSensitiveOverrideReady: false,
+  composeDraft: {
+    processo: '',
+    ciclo: 'Ciclo 1',
+    destinatario: '',
+    tipo: 'Solicitação de ajuste',
+    assunto: '',
+    mensagem: '',
+    gera_pendencia: false,
+    tipo_pendencia: 'Documental',
+    prazo: '',
+    anexo: null,
+    anexoNome: '',
+    registrar_biblioteca: true,
+    tipo_documento_anexo: 'Outro',
+  },
+  replyDrafts: {},
+  documentUploadDraft: {
+    processo: '',
+    ciclo: 'Ciclo 1',
+    tipo_documento: 'Projeto inicial',
+    file: null,
+    fileName: '',
+  },
 };
 
 const app = document.querySelector('#app');
@@ -31,19 +71,51 @@ const app = document.querySelector('#app');
 const STORAGE_KEY = 'nit-prototype-state-v1';
 const today = new Date('2026-04-24T12:00:00');
 const todayStr = '2026-04-24';
+const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 
 function currentUser() {
-  return users.find((user) => user.id === state.currentUserId);
+  return state.userList.find((user) => user.id === state.currentUserId);
+}
+
+function isResearcher(user = currentUser()) {
+  return user?.role === 'pesquisador';
+}
+
+function viewMode(user = currentUser()) {
+  return isResearcher(user) ? 'externa' : 'interna';
+}
+
+function availableRoutes(user = currentUser()) {
+  if (isResearcher(user)) {
+    return ['dashboard', 'processo', 'submissao', 'documentos', 'mensagens', 'notificacoes', 'conta'];
+  }
+  return ['dashboard', 'processo', 'submissao', 'documentos', 'mensagens', 'notificacoes', 'pendencias', 'relatorios', 'seguranca', 'conta'];
+}
+
+function defaultUsers() {
+  return structuredClone(users).map((user) => ({
+    ...user,
+    notificationEmail: user.email,
+    notifications: {
+      email: true,
+      inApp: true,
+      dailyDigest: false,
+    },
+  }));
 }
 
 function defaultState() {
   return {
+    userList: defaultUsers(),
     processList: structuredClone(processes),
     pendencyList: structuredClone(pendencies),
     messageList: structuredClone(messages),
     documentList: structuredClone(documents),
     aaciimList: structuredClone(aaciim),
     historyList: structuredClone(history),
+    incidentList: [],
+    auditList: [],
+    notificationList: [],
   };
 }
 
@@ -52,6 +124,19 @@ function hydrateState() {
     const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || 'null');
     const fallback = defaultState();
     Object.assign(state, fallback, saved || {});
+    const baselineUsers = defaultUsers();
+    const savedUsers = Array.isArray(state.userList) ? state.userList : [];
+    state.userList = baselineUsers.map((baseUser) => {
+      const existing = savedUsers.find((savedUser) => savedUser.id === baseUser.id);
+      return existing ? {
+        ...baseUser,
+        ...existing,
+        notifications: {
+          ...baseUser.notifications,
+          ...(existing.notifications || {}),
+        },
+      } : baseUser;
+    });
   } catch {
     Object.assign(state, defaultState());
   }
@@ -59,18 +144,253 @@ function hydrateState() {
 
 function persistState() {
   const payload = {
+    userList: state.userList,
     processList: state.processList,
     pendencyList: state.pendencyList,
     messageList: state.messageList,
     documentList: state.documentList,
     aaciimList: state.aaciimList,
     historyList: state.historyList,
+    incidentList: state.incidentList,
+    auditList: state.auditList,
+    notificationList: state.notificationList,
   };
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 }
 
+function nowLabel() {
+  return new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(new Date());
+}
+
+function auditTimestamp() {
+  return `${todayStr} ${nowLabel()}`;
+}
+
+function addAuditEntry(action, detail, context = {}) {
+  state.auditList = [
+    {
+      Auditoria_ID: `aud-${state.auditList.length + 1}`,
+      DataHora: auditTimestamp(),
+      Usuario_ID: currentUser().id,
+      Usuario_Nome: currentUser().name,
+      Acao: action,
+      Detalhe: detail,
+      ProcessoNIT_ID: context.ProcessoNIT_ID || '',
+      Rota: state.route,
+    },
+    ...state.auditList,
+  ];
+}
+
+function createNotification({
+  title,
+  detail,
+  recipientId = currentUser().id,
+  ProcessoNIT_ID = '',
+  route = 'notificacoes',
+  kind = 'info',
+}) {
+  state.notificationList = [
+    {
+      Notificacao_ID: `notif-${state.notificationList.length + 1}`,
+      title,
+      detail,
+      recipientId,
+      ProcessoNIT_ID,
+      route,
+      kind,
+      date: todayStr,
+      time: nowLabel(),
+      read: false,
+    },
+    ...state.notificationList,
+  ];
+}
+
+function visibleNotifications(user = currentUser()) {
+  return state.notificationList.filter((item) => item.recipientId === user.id);
+}
+
+function unreadNotificationCount(user = currentUser()) {
+  return visibleNotifications(user).filter((item) => !item.read).length;
+}
+
+function markNotificationRead(notificationId) {
+  state.notificationList = state.notificationList.map((item) =>
+    item.Notificacao_ID === notificationId ? { ...item, read: true } : item
+  );
+  persistState();
+  render();
+}
+
+function markAllNotificationsRead() {
+  const userId = currentUser().id;
+  state.notificationList = state.notificationList.map((item) =>
+    item.recipientId === userId ? { ...item, read: true } : item
+  );
+  persistState();
+  render();
+}
+
+function detectSensitiveSignals(values) {
+  const joined = values
+    .filter(Boolean)
+    .map((value) => String(value))
+    .join(' ')
+    .toLocaleLowerCase('pt-BR');
+
+  const patterns = [
+    { label: 'senha', regex: /\bsenha\b/ },
+    { label: 'token', regex: /\btoken\b/ },
+    { label: 'código MFA', regex: /\bmfa\b|\bcodigo\b|\bcódigo\b/ },
+    { label: 'CPF', regex: /\bcpf\b|\d{3}\.?\d{3}\.?\d{3}-?\d{2}/ },
+    { label: 'credencial', regex: /\bcredencial\b|\blogin\b/ },
+    { label: 'chave de API', regex: /\bapi key\b|\bapi-key\b|\bsecret\b|\bchave\b/ },
+  ];
+
+  return patterns.filter((pattern) => pattern.regex.test(joined)).map((pattern) => pattern.label);
+}
+
+function buildSensitiveWarning(values, channel) {
+  const hits = detectSensitiveSignals(values);
+  if (!hits.length) return null;
+  const message = `Possível dado sensível detectado em ${channel}: ${hits.join(', ')}. Remova esse conteúdo antes de continuar no protótipo.`;
+  return { message, hits };
+}
+
+function guardSensitiveSubmission(values, channel, onFailure = null) {
+  const warning = buildSensitiveWarning(values, channel);
+  if (!warning) return true;
+  if (typeof onFailure === 'function') {
+    onFailure(warning.message, warning.hits);
+  } else {
+    window.alert(warning.message);
+  }
+  return false;
+}
+
+function touchActivity() {
+  state.lastActivityAt = Date.now();
+}
+
+function beginFreshSession(message = 'Validação MFA obrigatória para acessar o protótipo.') {
+  state.mfaVerified = false;
+  state.sessionLocked = false;
+  state.lockReason = message;
+  state.pendingMfaCode = '';
+  state.mfaCodeIssuedAt = '';
+  touchActivity();
+}
+
+function lockSession(reason = 'Sessão bloqueada por segurança. Faça nova validação MFA.') {
+  state.mfaVerified = false;
+  state.sessionLocked = true;
+  state.lockReason = reason;
+  state.pendingMfaCode = '';
+  state.mfaCodeIssuedAt = '';
+  addAuditEntry('Bloqueio de sessão', reason);
+  render();
+}
+
+function switchUser(userId) {
+  state.currentUserId = userId;
+  const first = visibleProcesses()[0];
+  state.selectedProcessId = first?.id || state.selectedProcessId;
+  state.route = 'dashboard';
+  beginFreshSession('Troca de perfil detectada. Faça nova validação MFA.');
+  render();
+}
+
+function issueMfaCode() {
+  state.pendingMfaCode = String(Math.floor(100000 + Math.random() * 900000));
+  state.mfaCodeIssuedAt = nowLabel();
+  state.lockReason = state.sessionLocked
+    ? 'Sessão bloqueada. Informe o novo código MFA para desbloquear.'
+    : 'Código MFA gerado para esta sessão.';
+  render();
+}
+
+function validateMfa(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const code = String(form.get('codigo') || '').trim();
+  if (!state.pendingMfaCode) {
+    state.lockReason = 'Gere um código MFA antes de validar.';
+    render();
+    return;
+  }
+  if (code !== state.pendingMfaCode) {
+    state.lockReason = 'Código MFA inválido. Gere um novo código e tente novamente.';
+    state.pendingMfaCode = '';
+    state.mfaCodeIssuedAt = '';
+    render();
+    return;
+  }
+  state.mfaVerified = true;
+  state.sessionLocked = false;
+  state.lockReason = '';
+  state.pendingMfaCode = '';
+  state.mfaCodeIssuedAt = '';
+  touchActivity();
+  render();
+}
+
+function maybeLockForInactivity() {
+  if (!state.mfaVerified || state.sessionLocked) return;
+  if (Date.now() - state.lastActivityAt < SESSION_TIMEOUT_MS) return;
+  lockSession('Sessão bloqueada por inatividade. Refaça a validação MFA para continuar.');
+}
+
+function installSecurityWatchers() {
+  ['click', 'keydown', 'touchstart'].forEach((eventName) => {
+    window.addEventListener(eventName, () => {
+      if (state.mfaVerified && !state.sessionLocked) touchActivity();
+    }, { passive: true });
+  });
+  window.setInterval(maybeLockForInactivity, 10000);
+}
+
 function userName(id) {
-  return users.find((user) => user.id === id)?.name || 'Não atribuído';
+  return state.userList.find((user) => user.id === id)?.name || 'Não atribuído';
+}
+
+function roleLabel(role) {
+  if (['nit', 'coordenador', 'admin'].includes(role)) return 'NIT';
+  if (role === 'juridico') return 'Jurídico';
+  if (role === 'secretaria') return 'Secretaria/Coordenação';
+  return roles[role] || 'Equipe interna';
+}
+
+function displayActorName(id, viewer = currentUser()) {
+  const user = state.userList.find((item) => item.id === id);
+  if (!user) return 'Não atribuído';
+  if (!isResearcher(viewer)) return user.name;
+  if (user.role === 'pesquisador') return user.name;
+  return roleLabel(user.role);
+}
+
+function sanitizeForResearcher(text) {
+  if (!isResearcher() || !text) return text;
+  return String(text)
+    .replaceAll('Marina Costa', 'NIT')
+    .replaceAll('Ricardo Alves', 'NIT')
+    .replaceAll('Paulo Mendes', 'NIT')
+    .replaceAll('Lívia Fernandes', 'Jurídico')
+    .replaceAll('Carla Nogueira', 'Secretaria/Coordenação');
+}
+
+function internalRouteForProcess(process) {
+  if (!process) return '';
+  if (process.Fase_Atual.includes('Ciclo 2')) return process.Juridico_Atribuido_ID || process.Responsavel_Atual_ID || 'usr-paulo';
+  if (process.Fase_Atual.includes('Ciclo 3')) return process.Responsavel_Atual_ID || 'usr-carla' || 'usr-paulo';
+  return process.MembroNIT_Atribuido_ID || process.Responsavel_Atual_ID || 'usr-paulo';
+}
+
+function maskedResponsibleLabel(process, viewer = currentUser()) {
+  const responsible = state.userList.find((user) => user.id === process.Responsavel_Atual_ID);
+  if (!responsible) return 'Não atribuído';
+  if (!isResearcher(viewer)) return responsible.name;
+  return roleLabel(responsible.role);
 }
 
 function canViewProcess(process, user = currentUser()) {
@@ -113,6 +433,169 @@ function processByFunctionalId(ProcessoNIT_ID) {
   return state.processList.find((item) => item.ProcessoNIT_ID === ProcessoNIT_ID);
 }
 
+function messageById(messageId) {
+  return state.messageList.find((message) => message.Mensagem_ID === messageId) || null;
+}
+
+function composeDefaults(allowedIds = [], visibleUsers = []) {
+  const defaultProcess = allowedIds[0] || '';
+  const routedProcess = defaultProcess ? processByFunctionalId(defaultProcess) : null;
+  return {
+    processo: defaultProcess,
+    ciclo: 'Ciclo 1',
+    destinatario: isResearcher() ? internalRouteForProcess(routedProcess) : (visibleUsers[0]?.id || ''),
+    tipo: 'Solicitação de ajuste',
+    assunto: '',
+    mensagem: '',
+    gera_pendencia: false,
+    tipo_pendencia: 'Documental',
+    prazo: '',
+    anexo: null,
+    anexoNome: '',
+    registrar_biblioteca: true,
+    tipo_documento_anexo: 'Outro',
+  };
+}
+
+function ensureComposeDraft(allowedIds = [], visibleUsers = []) {
+  const defaults = composeDefaults(allowedIds, visibleUsers);
+  state.composeDraft = {
+    ...defaults,
+    ...state.composeDraft,
+    processo: state.composeDraft.processo || defaults.processo,
+    destinatario: state.composeDraft.destinatario || defaults.destinatario,
+  };
+  if (isResearcher()) {
+    const selectedProcess = processByFunctionalId(state.composeDraft.processo);
+    state.composeDraft.destinatario = internalRouteForProcess(selectedProcess);
+  }
+}
+
+function documentUploadDefaults(uploadableProcesses = []) {
+  return {
+    processo: uploadableProcesses[0]?.ProcessoNIT_ID || '',
+    ciclo: 'Ciclo 1',
+    tipo_documento: documentTypeOptions()[0],
+    file: null,
+    fileName: '',
+  };
+}
+
+function ensureDocumentUploadDraft(uploadableProcesses = []) {
+  const defaults = documentUploadDefaults(uploadableProcesses);
+  state.documentUploadDraft = {
+    ...defaults,
+    ...state.documentUploadDraft,
+    processo: state.documentUploadDraft.processo || defaults.processo,
+  };
+}
+
+function replySubjectFor(message) {
+  return message.Assunto.startsWith('Re:') ? message.Assunto : `Re: ${message.Assunto}`;
+}
+
+function ensureReplyDraft(message) {
+  if (!message || state.replyDrafts[message.Mensagem_ID]) return;
+  state.replyDrafts[message.Mensagem_ID] = {
+    assunto: replySubjectFor(message),
+    mensagem: '',
+    anexo: null,
+    anexoNome: '',
+    registrar_biblioteca: true,
+    tipo_documento_anexo: 'Outro',
+  };
+}
+
+function activeNitTaskCount(memberId) {
+  return state.processList.filter((process) =>
+    process.MembroNIT_Atribuido_ID === memberId &&
+    !['Concluído', 'Arquivado'].includes(process.Fase_Atual)
+  ).length;
+}
+
+function lateNitTaskCount(memberId) {
+  return state.processList.filter((process) =>
+    process.MembroNIT_Atribuido_ID === memberId &&
+    !['Concluído', 'Arquivado'].includes(process.Fase_Atual) &&
+    isLate(process)
+  ).length;
+}
+
+function nitCapacityStats() {
+  return state.userList
+    .filter((user) => user.role === 'nit')
+    .map((member) => {
+      const active = activeNitTaskCount(member.id);
+      const late = lateNitTaskCount(member.id);
+      const rate = active ? Math.round((late / active) * 100) : 0;
+      return {
+        id: member.id,
+        name: member.name,
+        active,
+        late,
+        rate,
+      };
+    })
+    .sort((left, right) => {
+      if (left.active !== right.active) return left.active - right.active;
+      if (left.late !== right.late) return left.late - right.late;
+      return left.name.localeCompare(right.name, 'pt-BR');
+    });
+}
+
+function pickLowestLoadNitMember() {
+  const nitMembers = state.userList.filter((user) => user.role === 'nit');
+  if (!nitMembers.length) return null;
+  return [...nitMembers]
+    .sort((left, right) => {
+      const loadDiff = activeNitTaskCount(left.id) - activeNitTaskCount(right.id);
+      if (loadDiff !== 0) return loadDiff;
+      return left.name.localeCompare(right.name, 'pt-BR');
+    })[0];
+}
+
+function registerMessageAttachmentAsDocument({
+  ProcessoNIT_ID,
+  Ciclo,
+  Tipo_Documento,
+  file,
+  origemMensagemId,
+}) {
+  if (!(file instanceof File) || !file.name) return;
+  const existingVersions = documentVersions(ProcessoNIT_ID, Tipo_Documento);
+  const nextVersion = (existingVersions[0]?.Versao || 0) + 1;
+  const replacedDocId = existingVersions[0]?.Documento_ID;
+
+  state.documentList = state.documentList.map((doc) =>
+    doc.Documento_ID === replacedDocId ? { ...doc, Status_Documento: 'Substituído' } : doc
+  );
+
+  state.documentList = [
+    {
+      Documento_ID: `doc-${state.documentList.length + 1}`,
+      ProcessoNIT_ID,
+      Tipo_Documento,
+      Ciclo,
+      Nome_Arquivo: file.name,
+      Versao: nextVersion,
+      Status_Documento: nextVersion > 1 ? 'Submetido' : 'Em análise',
+      Data_Upload: todayStr,
+      EnviadoPor_ID: currentUser().id,
+      Tamanho_Arquivo: file.size,
+      MimeType: file.type || 'application/octet-stream',
+      Origem: 'Mensagem',
+      Origem_Mensagem_ID: origemMensagemId,
+    },
+    ...state.documentList,
+  ];
+
+  addHistoryItem(
+    ProcessoNIT_ID,
+    nextVersion > 1 ? 'Nova versão documental via mensagem' : 'Documento registrado via mensagem',
+    `${Tipo_Documento} ${nextVersion > 1 ? `atualizado para v${nextVersion}` : 'registrado'} a partir da mensagem ${origemMensagemId}.`
+  );
+}
+
 function canGenerateAi(process, user = currentUser()) {
   return ['nit', 'coordenador', 'admin'].includes(user.role) && canViewProcess(process, user);
 }
@@ -142,6 +625,15 @@ function processPendencyCount(processId) {
 
 function unreadMessageCount(processId) {
   return state.messageList.filter((message) => message.ProcessoNIT_ID === processId && !message.Lida).length;
+}
+
+function unreadInboxCount(user = currentUser()) {
+  const visibleIds = visibleProcesses().map((process) => process.ProcessoNIT_ID);
+  return state.messageList.filter((message) =>
+    message.Destinatario_ID === user.id &&
+    !message.Lida &&
+    visibleIds.includes(message.ProcessoNIT_ID)
+  ).length;
 }
 
 function daysBetween(start, end) {
@@ -217,12 +709,13 @@ function matchesProcessSearch(process) {
     process.Status_Atual,
     process.ParecerInicial_Numero,
     process.CertificadoFinal_Numero,
-    userName(process.Responsavel_Atual_ID),
+    maskedResponsibleLabel(process),
   ]);
 }
 
 function matchesDocumentSearch(doc) {
   const process = state.processList.find((item) => item.ProcessoNIT_ID === doc.ProcessoNIT_ID);
+  const originMessage = doc.Origem_Mensagem_ID ? messageById(doc.Origem_Mensagem_ID) : null;
   return textMatches([
     doc.ProcessoNIT_ID,
     doc.Tipo_Documento,
@@ -230,7 +723,10 @@ function matchesDocumentSearch(doc) {
     doc.Nome_Arquivo,
     doc.Versao,
     doc.Status_Documento,
-    userName(doc.EnviadoPor_ID),
+    displayActorName(doc.EnviadoPor_ID),
+    doc.Origem,
+    originMessage?.Assunto,
+    doc.Origem_Mensagem_ID,
     process?.Titulo_Projeto,
     process?.Pesquisador_Nome,
   ]);
@@ -244,8 +740,8 @@ function matchesMessageSearch(message) {
     message.Tipo_Mensagem,
     message.Assunto,
     message.Corpo_Mensagem,
-    userName(message.Remetente_ID),
-    userName(message.Destinatario_ID),
+    displayActorName(message.Remetente_ID),
+    displayActorName(message.Destinatario_ID),
     process?.Titulo_Projeto,
     process?.Pesquisador_Nome,
   ]);
@@ -259,7 +755,7 @@ function matchesPendencySearch(pendency) {
     pendency.Tipo_Pendencia,
     pendency.Descricao_Pendencia,
     pendency.Status_Pendencia,
-    userName(pendency.Responsavel_Resposta_ID),
+    displayActorName(pendency.Responsavel_Resposta_ID),
     process?.Titulo_Projeto,
     process?.Pesquisador_Nome,
   ]);
@@ -296,6 +792,9 @@ function h(tag, attrs = {}, children = []) {
     if (key === 'class') node.className = value;
     else if (key === 'text') node.textContent = value;
     else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+    else if (key === 'value') node.value = value;
+    else if (key === 'checked') node.checked = Boolean(value);
+    else if (key === 'selected') node.selected = Boolean(value);
     else if (value !== false && value !== null && value !== undefined) node.setAttribute(key, value === true ? '' : value);
   });
   children.forEach((child) => {
@@ -312,8 +811,11 @@ function icon(name) {
     submit: '+',
     docs: '□',
     messages: '✉',
+    notifications: '◉',
     pendencies: '!',
     reports: '▥',
+    security: '⛨',
+    account: '⚙',
     user: '●',
     pdf: 'PDF',
     ai: 'AI',
@@ -333,9 +835,18 @@ function selectProcess(id) {
 }
 
 function updateProcess(id, patch) {
+  const before = state.processList.find((process) => process.id === id);
   state.processList = state.processList.map((process) =>
     process.id === id ? { ...process, ...patch, Data_Ultima_Atualizacao: todayStr } : process
   );
+  const after = state.processList.find((process) => process.id === id);
+  if (before && after && (before.Fase_Atual !== after.Fase_Atual || before.Status_Atual !== after.Status_Atual)) {
+    addAuditEntry(
+      'Atualização de fase/status',
+      `${after.ProcessoNIT_ID} mudou para ${after.Fase_Atual} / ${after.Status_Atual}.`,
+      { ProcessoNIT_ID: after.ProcessoNIT_ID }
+    );
+  }
   persistState();
   render();
 }
@@ -378,7 +889,21 @@ function documentTypeOptions() {
   ];
 }
 
-function createMessage({ ProcessoNIT_ID, Ciclo, Destinatario_ID, Tipo_Mensagem, Assunto, Corpo_Mensagem, Gera_Pendencia = false, Prazo_Resposta = '', Tipo_Pendencia = 'Técnica' }) {
+function createMessage({
+  ProcessoNIT_ID,
+  Ciclo,
+  Destinatario_ID,
+  Tipo_Mensagem,
+  Assunto,
+  Corpo_Mensagem,
+  Gera_Pendencia = false,
+  Prazo_Resposta = '',
+  Tipo_Pendencia = 'Técnica',
+  Mensagem_Pai_ID = '',
+  Anexo = null,
+  RegistrarBiblioteca = false,
+  TipoDocumentoAnexo = 'Outro',
+}) {
   const process = processByFunctionalId(ProcessoNIT_ID);
   if (!process) return;
   const messageId = `msg-${state.messageList.length + 1}`;
@@ -400,8 +925,27 @@ function createMessage({ ProcessoNIT_ID, Ciclo, Destinatario_ID, Tipo_Mensagem, 
       },
       ...state.pendencyList,
     ];
-    addHistoryItem(ProcessoNIT_ID, 'Pendência criada', `${Tipo_Pendencia} aberta para ${userName(Destinatario_ID)}.`);
+    addHistoryItem(ProcessoNIT_ID, 'Pendência criada', `${Tipo_Pendencia} aberta para ${displayActorName(Destinatario_ID)}.`);
+    addAuditEntry('Abertura de pendência', `${pendenciaId} criada a partir de mensagem.`, { ProcessoNIT_ID });
+    createNotification({
+      title: 'Nova pendência vinculada',
+      detail: `A comunicação "${Assunto}" abriu a pendência ${pendenciaId}.`,
+      recipientId: Destinatario_ID,
+      ProcessoNIT_ID,
+      route: 'pendencias',
+      kind: 'alert',
+    });
   }
+
+  const attachmentMeta = Anexo instanceof File && Anexo.name
+    ? {
+        name: Anexo.name,
+        size: Anexo.size,
+        type: Anexo.type || 'application/octet-stream',
+        registeredInLibrary: RegistrarBiblioteca,
+        documentType: TipoDocumentoAnexo,
+      }
+    : null;
 
   state.messageList = [
     {
@@ -416,11 +960,33 @@ function createMessage({ ProcessoNIT_ID, Ciclo, Destinatario_ID, Tipo_Mensagem, 
       Data_Envio: todayStr,
       Lida: false,
       Pendencia_ID: pendenciaId,
+      Mensagem_Pai_ID,
+      Anexo: attachmentMeta,
     },
     ...state.messageList,
   ];
 
-  addHistoryItem(ProcessoNIT_ID, 'Mensagem enviada', `${Tipo_Mensagem}: ${Assunto}.`);
+  if (attachmentMeta && RegistrarBiblioteca) {
+    registerMessageAttachmentAsDocument({
+      ProcessoNIT_ID,
+      Ciclo,
+      Tipo_Documento: TipoDocumentoAnexo,
+      file: Anexo,
+      origemMensagemId: messageId,
+    });
+    addAuditEntry('Documento registrado via mensagem', `${Anexo.name} registrado também na biblioteca.`, { ProcessoNIT_ID });
+  }
+
+  addHistoryItem(ProcessoNIT_ID, Mensagem_Pai_ID ? 'Resposta enviada' : 'Mensagem enviada', `${Tipo_Mensagem}: ${Assunto}.`);
+  addAuditEntry(Mensagem_Pai_ID ? 'Resposta enviada' : 'Mensagem enviada', `${Assunto} para ${displayActorName(Destinatario_ID)}.`, { ProcessoNIT_ID });
+  createNotification({
+    title: Mensagem_Pai_ID ? 'Nova resposta recebida' : 'Nova mensagem recebida',
+    detail: `${displayActorName(currentUser().id, state.userList.find((user) => user.id === Destinatario_ID))} enviou: ${Assunto}.`,
+    recipientId: Destinatario_ID,
+    ProcessoNIT_ID,
+    route: 'mensagens',
+    kind: 'message',
+  });
   persistState();
 }
 
@@ -440,16 +1006,25 @@ function documentVersions(ProcessoNIT_ID, Tipo_Documento) {
     .sort((a, b) => b.Versao - a.Versao);
 }
 
-function uploadDocument(event) {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const ProcessoNIT_ID = form.get('processo');
+function uploadDocument(event, forceSensitiveOverride = false) {
+  if (event?.preventDefault) event.preventDefault();
+  const form = event?.currentTarget || document.querySelector('[data-document-upload-form]');
+  const draft = state.documentUploadDraft;
+  const ProcessoNIT_ID = draft.processo;
   const process = processByFunctionalId(ProcessoNIT_ID);
   if (!process || !canUploadForProcess(process)) return;
-  const file = form.get('arquivo');
+  const file = draft.file;
   if (!(file instanceof File) || !file.name) return;
 
-  const Tipo_Documento = form.get('tipo_documento');
+  const sensitivity = buildSensitiveWarning([draft.fileName, draft.tipo_documento, process.Titulo_Projeto], 'upload documental');
+  if (sensitivity && !forceSensitiveOverride) {
+    state.documentUploadWarning = `${sensitivity.message} Se o documento for essencial para a tramitação, revise ou use "Enviar mesmo assim".`;
+    state.documentSensitiveOverrideReady = true;
+    render();
+    return;
+  }
+
+  const Tipo_Documento = draft.tipo_documento;
   const existingVersions = documentVersions(ProcessoNIT_ID, Tipo_Documento);
   const nextVersion = (existingVersions[0]?.Versao || 0) + 1;
   const replacedDocId = existingVersions[0]?.Documento_ID;
@@ -463,7 +1038,7 @@ function uploadDocument(event) {
       Documento_ID: `doc-${state.documentList.length + 1}`,
       ProcessoNIT_ID,
       Tipo_Documento,
-      Ciclo: form.get('ciclo'),
+      Ciclo: draft.ciclo,
       Nome_Arquivo: file.name,
       Versao: nextVersion,
       Status_Documento: nextVersion > 1 ? 'Submetido' : 'Em análise',
@@ -471,6 +1046,7 @@ function uploadDocument(event) {
       EnviadoPor_ID: currentUser().id,
       Tamanho_Arquivo: file.size,
       MimeType: file.type || 'application/octet-stream',
+      SensivelConfirmado: Boolean(sensitivity),
     },
     ...state.documentList,
   ];
@@ -478,22 +1054,44 @@ function uploadDocument(event) {
   addHistoryItem(
     ProcessoNIT_ID,
     nextVersion > 1 ? 'Nova versão documental' : 'Documento enviado',
-    `${Tipo_Documento} ${nextVersion > 1 ? `atualizado para v${nextVersion}` : 'enviado'} por ${currentUser().name}.`
+    `${Tipo_Documento} ${nextVersion > 1 ? `atualizado para v${nextVersion}` : 'enviado'} por ${displayActorName(currentUser().id)}.`
   );
+  addAuditEntry(
+    nextVersion > 1 ? 'Nova versão documental' : 'Upload documental',
+    `${file.name} registrado em ${ProcessoNIT_ID}${sensitivity ? ' com confirmação consciente de dado sensível' : ''}.`,
+    { ProcessoNIT_ID }
+  );
+  state.documentUploadWarning = '';
+  state.documentSensitiveOverrideReady = false;
+  state.documentUploadDraft = documentUploadDefaults(visibleProcesses().filter((item) => canUploadForProcess(item)));
   persistState();
-  event.currentTarget.reset();
+  if (form?.reset) form.reset();
   render();
 }
 
 function assignNitMember(processId, memberId) {
   const process = state.processList.find((item) => item.id === processId);
   if (!process || !canAssignNitMember()) return;
+  const wasAssigned = Boolean(process.MembroNIT_Atribuido_ID);
   updateProcess(processId, {
     MembroNIT_Atribuido_ID: memberId,
     Responsavel_Atual_ID: memberId,
     Status_Atual: 'Em triagem',
   });
-  addHistoryItem(process.ProcessoNIT_ID, 'Atribuição NIT', `Processo atribuído a ${userName(memberId)} para avaliação inicial.`);
+  addHistoryItem(
+    process.ProcessoNIT_ID,
+    wasAssigned ? 'Redirecionamento NIT' : 'Atribuição NIT',
+    `Processo ${wasAssigned ? 'redirecionado' : 'atribuído'} para ${userName(memberId)} para avaliação inicial.`
+  );
+  addAuditEntry(wasAssigned ? 'Redirecionamento NIT' : 'Atribuição NIT', `${process.ProcessoNIT_ID} -> ${userName(memberId)}.`, { ProcessoNIT_ID: process.ProcessoNIT_ID });
+  createNotification({
+    title: wasAssigned ? 'Processo redirecionado para você' : 'Novo processo atribuído',
+    detail: `${process.ProcessoNIT_ID} foi ${wasAssigned ? 'redirecionado' : 'atribuído'} para sua fila de trabalho.`,
+    recipientId: memberId,
+    ProcessoNIT_ID: process.ProcessoNIT_ID,
+    route: 'processo',
+    kind: 'task',
+  });
   persistState();
   render();
 }
@@ -524,6 +1122,7 @@ function generateAiAnalysis(processId) {
     Responsavel_Atual_ID: process.MembroNIT_Atribuido_ID || currentUser().id,
   });
   addHistoryItem(process.ProcessoNIT_ID, 'Pré-análise IA', 'Pré-avaliação AACIIm gerada a partir do arquivo do projeto.');
+  addAuditEntry('Pré-análise IA', `${process.ProcessoNIT_ID} avaliado em modo assistivo.`, { ProcessoNIT_ID: process.ProcessoNIT_ID });
   persistState();
   render();
 }
@@ -580,15 +1179,28 @@ function issueInitialOpinion(processId, decision) {
       ...state.documentList,
     ];
   }
-  addHistoryItem(process.ProcessoNIT_ID, 'Parecer inicial emitido', `${parecerNumero} emitido por ${currentUser().name}.`);
+  addHistoryItem(process.ProcessoNIT_ID, 'Parecer inicial emitido', `${parecerNumero} emitido por ${displayActorName(currentUser().id)}.`);
+  addAuditEntry('Emissão de parecer inicial', `${parecerNumero} (${decision}) para ${process.ProcessoNIT_ID}.`, { ProcessoNIT_ID: process.ProcessoNIT_ID });
+  createNotification({
+    title: 'Parecer inicial emitido',
+    detail: `O processo ${process.ProcessoNIT_ID} recebeu o parecer ${parecerNumero}.`,
+    recipientId: process.Pesquisador_ID,
+    ProcessoNIT_ID: process.ProcessoNIT_ID,
+    route: 'processo',
+    kind: 'update',
+  });
   persistState();
   render();
 }
 
 function markMessageAsRead(messageId) {
+  const target = state.messageList.find((message) => message.Mensagem_ID === messageId);
   state.messageList = state.messageList.map((message) =>
     message.Mensagem_ID === messageId ? { ...message, Lida: true, Data_Leitura: todayStr } : message
   );
+  if (target) {
+    addAuditEntry('Leitura de mensagem', `${target.Assunto} marcada como lida.`, { ProcessoNIT_ID: target.ProcessoNIT_ID });
+  }
   persistState();
   render();
 }
@@ -607,25 +1219,102 @@ function updatePendencyStatus(pendencyId, status) {
       : item
   );
   addHistoryItem(pendency.ProcessoNIT_ID, 'Pendência atualizada', `${pendency.Pendencia_ID} agora está como ${status}.`);
+  addAuditEntry('Atualização de pendência', `${pendency.Pendencia_ID} -> ${status}.`, { ProcessoNIT_ID: pendency.ProcessoNIT_ID });
+  createNotification({
+    title: 'Pendência atualizada',
+    detail: `${pendency.Pendencia_ID} mudou para ${status}.`,
+    recipientId: pendency.Responsavel_Resposta_ID,
+    ProcessoNIT_ID: pendency.ProcessoNIT_ID,
+    route: 'pendencias',
+    kind: 'task',
+  });
   persistState();
   render();
 }
 
-function addMessageFromForm(event) {
+function addMessageFromForm(event, forceSensitiveOverride = false) {
   event.preventDefault();
-  const form = new FormData(event.currentTarget);
+  const draft = state.composeDraft;
+  const process = processByFunctionalId(draft.processo);
+  if (!process) return;
+
+  const sensitivity = buildSensitiveWarning([
+    draft.assunto,
+    draft.mensagem,
+    draft.anexoNome,
+    draft.tipo_documento_anexo,
+  ], 'mensagem');
+
+  if (sensitivity && !forceSensitiveOverride) {
+    state.composeMessageWarning = `${sensitivity.message} Revise o texto ou use "Enviar mesmo assim" se o conteúdo for necessário para a tramitação.`;
+    state.composeSensitiveOverrideReady = true;
+    render();
+    return;
+  }
+
   createMessage({
-    ProcessoNIT_ID: form.get('processo'),
-    Ciclo: form.get('ciclo'),
-    Destinatario_ID: form.get('destinatario'),
-    Tipo_Mensagem: form.get('tipo'),
-    Assunto: form.get('assunto'),
-    Corpo_Mensagem: form.get('mensagem'),
-    Gera_Pendencia: form.get('gera_pendencia') === 'on',
-    Prazo_Resposta: form.get('prazo'),
-    Tipo_Pendencia: form.get('tipo_pendencia') || 'Técnica',
+    ProcessoNIT_ID: draft.processo,
+    Ciclo: draft.ciclo,
+    Destinatario_ID: draft.destinatario,
+    Tipo_Mensagem: draft.tipo,
+    Assunto: draft.assunto,
+    Corpo_Mensagem: draft.mensagem,
+    Gera_Pendencia: draft.gera_pendencia,
+    Prazo_Resposta: draft.prazo,
+    Tipo_Pendencia: draft.tipo_pendencia || 'Técnica',
+    Anexo: draft.anexo,
+    RegistrarBiblioteca: draft.registrar_biblioteca,
+    TipoDocumentoAnexo: draft.tipo_documento_anexo,
   });
-  event.currentTarget.reset();
+
+  state.composeDraft = composeDefaults(visibleProcesses().map((candidate) => candidate.ProcessoNIT_ID), visibleRecipientsForCompose());
+  state.composeMessageWarning = '';
+  state.composeSensitiveOverrideReady = false;
+  persistState();
+  render();
+}
+
+function addReplyMessage(parentMessageId, forceSensitiveOverride = false) {
+  const parent = messageById(parentMessageId);
+  if (!parent) return;
+  ensureReplyDraft(parent);
+  const draft = state.replyDrafts[parentMessageId];
+  const process = processByFunctionalId(parent.ProcessoNIT_ID);
+  if (!process) return;
+
+  const sensitivity = buildSensitiveWarning([
+    draft.assunto,
+    draft.mensagem,
+    draft.anexoNome,
+    draft.tipo_documento_anexo,
+  ], 'resposta');
+
+  if (sensitivity && !forceSensitiveOverride) {
+    state.replyWarning = `${sensitivity.message} Revise o texto ou use "Enviar mesmo assim" se o conteúdo for necessário para a tramitação.`;
+    state.replySensitiveOverrideReady = true;
+    state.replyToMessageId = parentMessageId;
+    render();
+    return;
+  }
+
+  createMessage({
+    ProcessoNIT_ID: parent.ProcessoNIT_ID,
+    Ciclo: parent.Ciclo,
+    Destinatario_ID: parent.Remetente_ID,
+    Tipo_Mensagem: 'Resposta',
+    Assunto: draft.assunto,
+    Corpo_Mensagem: draft.mensagem,
+    Mensagem_Pai_ID: parentMessageId,
+    Anexo: draft.anexo,
+    RegistrarBiblioteca: draft.registrar_biblioteca,
+    TipoDocumentoAnexo: draft.tipo_documento_anexo,
+  });
+
+  delete state.replyDrafts[parentMessageId];
+  state.replyWarning = '';
+  state.replySensitiveOverrideReady = false;
+  state.replyToMessageId = '';
+  persistState();
   render();
 }
 
@@ -649,78 +1338,236 @@ function addPendencyFromForm(event) {
     ...state.pendencyList,
   ];
   addHistoryItem(ProcessoNIT_ID, 'Pendência criada', `${Pendencia_ID} aberta manualmente por ${currentUser().name}.`);
+  addAuditEntry('Abertura manual de pendência', `${Pendencia_ID} criada manualmente.`, { ProcessoNIT_ID });
   persistState();
   event.currentTarget.reset();
+  render();
+}
+
+function addIncidentFromForm(event, forceSensitiveOverride = false) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const Categoria = form.get('categoria');
+  const ProcessoNIT_ID = form.get('processo') || '';
+  const Resumo = form.get('resumo');
+  const Acao_Imediata = form.get('acao_imediata');
+
+  const sensitivity = buildSensitiveWarning([Categoria, Resumo, Acao_Imediata], 'reporte de incidente');
+  if (sensitivity && !forceSensitiveOverride) {
+    window.alert(`${sensitivity.message} Neste protótipo, o texto foi bloqueado até revisão.`);
+    return;
+  }
+
+  state.incidentList = [
+    {
+      Incidente_ID: `inc-${state.incidentList.length + 1}`,
+      Categoria,
+      ProcessoNIT_ID,
+      Resumo,
+      Acao_Imediata,
+      Data_Registro: todayStr,
+      Hora_Registro: nowLabel(),
+      ReportadoPor_ID: currentUser().id,
+      Status: 'Reportado',
+    },
+    ...state.incidentList,
+  ];
+  addAuditEntry('Reporte de incidente', `${Categoria}${ProcessoNIT_ID ? ` no processo ${ProcessoNIT_ID}` : ''}.`, { ProcessoNIT_ID });
+  persistState();
+  event.currentTarget.reset();
+  render();
+}
+
+function saveAccountSettings(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  state.userList = state.userList.map((user) =>
+    user.id === state.currentUserId
+      ? {
+          ...user,
+          notificationEmail: form.get('notification_email') || user.notificationEmail,
+          notifications: {
+            email: form.get('notif_email') === 'on',
+            inApp: form.get('notif_in_app') === 'on',
+            dailyDigest: form.get('notif_digest') === 'on',
+          },
+        }
+      : user
+  );
+  persistState();
   render();
 }
 
 function addDemoProcess(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
-  const user = currentUser().role === 'pesquisador' ? currentUser() : users.find((item) => item.role === 'pesquisador');
-  const id = `proc-${state.processList.length + 1}`;
-  const processoId = nextProcessNumber();
+  const file = form.get('arquivo');
+  if (!(file instanceof File) || !file.name) return;
+
+  const sensitivity = buildSensitiveWarning([
+    form.get('titulo'),
+    form.get('resumo'),
+    file.name,
+  ], 'submissão inicial');
+  if (sensitivity) {
+    window.alert(`${sensitivity.message} Ajuste o conteúdo antes de prosseguir com a submissão no protótipo.`);
+    return;
+  }
+
+  const researcher = isResearcher() ? currentUser() : state.userList.find((user) => user.role === 'pesquisador');
+  const autoAssignedMember = pickLowestLoadNitMember();
+  const ProcessoNIT_ID = nextProcessNumber();
   const newProcess = {
-    id,
-    ProcessoNIT_ID: processoId,
+    id: `proc-${state.processList.length + 1}`,
+    ProcessoNIT_ID,
     Titulo_Projeto: form.get('titulo'),
     Resumo_Projeto: form.get('resumo'),
-    Pesquisador_ID: user.id,
-    Pesquisador_Nome: user.name,
+    Pesquisador_ID: researcher.id,
+    Pesquisador_Nome: researcher.name,
     Orientador_Nome: form.get('orientador'),
     Programa_Curso: form.get('programa'),
     Tipo_ProdutoTecnico: form.get('tipo'),
     Fase_Atual: 'Ciclo 1 - AACIIm Inicial',
-    Status_Atual: 'Submetido',
-    Responsavel_Atual_ID: 'usr-marina',
+    Status_Atual: 'Em triagem',
+    Responsavel_Atual_ID: autoAssignedMember?.id || 'usr-paulo',
     Juridico_Atribuido_ID: '',
-    MembroNIT_Atribuido_ID: 'usr-marina',
+    MembroNIT_Atribuido_ID: autoAssignedMember?.id || '',
     Data_Abertura_Processo: todayStr,
     Data_Ultima_Atualizacao: todayStr,
-    Data_Limite_Ciclo1: '2026-05-09',
-    Data_Limite_Ciclo2: '2026-06-09',
-    Data_Limite_Ciclo3: '2026-10-09',
+    Data_Limite_Ciclo1: todayStr,
+    Data_Limite_Ciclo2: '2026-05-20',
+    Data_Limite_Ciclo3: '2026-09-01',
     ParecerInicial_Numero: '',
     CertificadoFinal_Numero: '',
     Atrasado: false,
     Dias_Em_Atraso: 0,
   };
+
   state.processList = [newProcess, ...state.processList];
   state.documentList = [
     {
       Documento_ID: `doc-${state.documentList.length + 1}`,
-      ProcessoNIT_ID: processoId,
+      ProcessoNIT_ID,
       Tipo_Documento: 'Projeto inicial',
       Ciclo: 'Ciclo 1',
-      Nome_Arquivo: form.get('arquivo')?.name || 'projeto-inicial.pdf',
+      Nome_Arquivo: file.name,
       Versao: 1,
       Status_Documento: 'Submetido',
       Data_Upload: todayStr,
-      EnviadoPor_ID: user.id,
+      EnviadoPor_ID: researcher.id,
+      Tamanho_Arquivo: file.size,
+      MimeType: file.type || 'application/octet-stream',
     },
     ...state.documentList,
   ];
-  state.messageList = [
-    {
-      Mensagem_ID: `msg-${state.messageList.length + 1}`,
-      ProcessoNIT_ID: processoId,
-      Ciclo: 'Ciclo 1',
-      Remetente_ID: user.id,
-      Destinatario_ID: 'usr-marina',
-      Tipo_Mensagem: 'Registro de decisão',
-      Assunto: 'Nova submissão inicial',
-      Corpo_Mensagem: `Processo ${processoId} submetido e encaminhado para triagem inicial do NIT.`,
-      Data_Envio: todayStr,
-      Lida: false,
-      Pendencia_ID: '',
-    },
-    ...state.messageList,
-  ];
-  addHistoryItem(processoId, 'Processo aberto', `Submissão inicial realizada por ${user.name}.`);
+
+  addHistoryItem(ProcessoNIT_ID, 'Processo aberto', `Projeto inicial submetido por ${researcher.name}.`);
+  if (autoAssignedMember) {
+    addHistoryItem(ProcessoNIT_ID, 'Distribuição automática NIT', `Processo direcionado automaticamente para ${autoAssignedMember.name} por menor carga ativa.`);
+    createNotification({
+      title: 'Novo processo na sua fila',
+      detail: `${ProcessoNIT_ID} foi atribuído automaticamente para equilíbrio de carga.`,
+      recipientId: autoAssignedMember.id,
+      ProcessoNIT_ID,
+      route: 'processo',
+      kind: 'task',
+    });
+  }
+
+  createMessage({
+    ProcessoNIT_ID,
+    Ciclo: 'Ciclo 1',
+    Destinatario_ID: researcher.id,
+    Tipo_Mensagem: 'Registro de decisão',
+    Assunto: 'Submissão inicial recebida',
+    Corpo_Mensagem: autoAssignedMember
+      ? `Sua submissão foi recebida e direcionada internamente para avaliação pelo NIT.`
+      : 'Sua submissão foi recebida e entrará na fila de avaliação do NIT.',
+  });
+
+  addAuditEntry('Submissão inicial', `${ProcessoNIT_ID} criado com arquivo ${file.name}.`, { ProcessoNIT_ID });
+  state.selectedProcessId = newProcess.id;
   persistState();
-  state.selectedProcessId = id;
-  state.route = 'processo';
+  event.currentTarget.reset();
   render();
+}
+
+function metricCard(label, value, helper) {
+  return h('article', { class: 'metric' }, [
+    h('span', { text: label }),
+    h('strong', { text: String(value) }),
+    h('small', { text: helper }),
+  ]);
+}
+
+function navItem(route, label, iconName, badgeCount = 0) {
+  return h('button', {
+    class: `nav-item ${state.route === route ? 'active' : ''}`,
+    type: 'button',
+    onclick: () => setRoute(route),
+  }, [
+    icon(iconName),
+    h('span', { text: label }),
+    badgeCount ? h('span', { class: 'nav-badge', text: String(badgeCount) }) : null,
+  ]);
+}
+
+function visibleRecipientsForCompose() {
+  const process = processByFunctionalId(state.composeDraft.processo);
+  if (isResearcher()) {
+    const routeTarget = internalRouteForProcess(process);
+    const routedUser = state.userList.find((user) => user.id === routeTarget);
+    return routedUser ? [routedUser] : [];
+  }
+  return state.userList.filter((user) => user.id !== currentUser().id);
+}
+
+function searchBox({ context = 'sidebar' } = {}) {
+  return h('label', { class: 'global-search' }, [
+    h('span', { text: 'Busca' }),
+    h('input', {
+      type: 'search',
+      placeholder: 'Pesquisar processo, pessoa, documento ou status',
+      value: state.searchDraft,
+      'data-search-box': context,
+      oninput: (event) => {
+        state.searchDraft = event.target.value;
+        state.searchTerm = state.searchDraft;
+        state.activeSearchBox = context;
+        const first = visibleProcesses()[0];
+        if (first && !visibleProcesses().some((process) => process.id === state.selectedProcessId)) {
+          state.selectedProcessId = first.id;
+        }
+        render();
+      },
+      onfocus: () => {
+        state.activeSearchBox = context;
+      },
+      onkeydown: (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          applySearch(context);
+        }
+      },
+    }),
+    h('button', {
+      class: 'search-trigger',
+      type: 'button',
+      title: 'Buscar',
+      onclick: () => applySearch(context),
+    }, ['⌕']),
+    h('button', {
+      class: 'search-clear',
+      type: 'button',
+      title: 'Limpar busca',
+      onclick: () => {
+        state.searchDraft = '';
+        state.searchTerm = '';
+        state.activeSearchBox = context;
+        render();
+      },
+    }, ['×']),
+  ]);
 }
 
 function shell(content) {
@@ -730,42 +1577,50 @@ function shell(content) {
       h('div', { class: 'brand' }, [
         h('div', { class: 'brand-mark', text: 'NIT' }),
         h('div', {}, [
-          h('strong', { text: 'Núcleo de Inovação' }),
-          h('span', { text: 'Protótipo institucional' }),
+          h('strong', { text: 'Gerenciador NIT' }),
+          h('span', { text: 'Protótipo local de tramitação por ciclos' }),
         ]),
       ]),
       h('label', { class: 'user-switch' }, [
         h('span', { text: 'Perfil ativo' }),
         h('select', {
-          onchange: (event) => {
-            state.currentUserId = event.target.value;
-            const first = visibleProcesses()[0];
-            state.selectedProcessId = first?.id || state.selectedProcessId;
-            render();
-          },
-        }, users.map((item) => h('option', { value: item.id, selected: item.id === user.id, text: `${item.name} · ${roles[item.role]}` }))),
+          value: state.currentUserId,
+          onchange: (event) => switchUser(event.target.value),
+        }, state.userList.map((candidate) => h('option', {
+          value: candidate.id,
+          selected: candidate.id === state.currentUserId,
+          text: `${candidate.name} · ${roles[candidate.role]}`,
+        }))),
       ]),
-      searchBox('sidebar-search'),
-      navButton('dashboard', 'Dashboard', 'dashboard'),
-      navButton('processo', 'Processos', 'process'),
-      navButton('submissao', 'Nova submissão', 'submit'),
-      navButton('documentos', 'Documentos', 'docs'),
-      navButton('mensagens', 'Mensagens', 'messages'),
-      navButton('pendencias', 'Pendências', 'pendencies'),
-      navButton('relatorios', 'Relatórios', 'reports'),
+      searchBox({ context: 'sidebar' }),
+      navItem('dashboard', 'Dashboard', 'dashboard'),
+      navItem('processo', 'Processos', 'process'),
+      navItem('submissao', 'Nova submissão', 'submit'),
+      navItem('documentos', 'Documentos', 'docs'),
+      navItem('mensagens', 'Mensagens', 'messages', unreadInboxCount()),
+      navItem('notificacoes', 'Notificações', 'notifications', unreadNotificationCount()),
+      !isResearcher(user) ? navItem('pendencias', 'Pendências', 'pendencies') : null,
+      !isResearcher(user) ? navItem('relatorios', 'Relatórios', 'reports') : null,
+      !isResearcher(user) ? navItem('seguranca', 'Segurança', 'security') : null,
+      navItem('conta', 'Conta e notificações', 'account'),
     ]),
     h('main', { class: 'main' }, [
+      securityBanner(),
       h('header', { class: 'topbar' }, [
         h('div', {}, [
-          h('p', { class: 'eyebrow', text: roles[user.role] }),
-          h('h1', { text: titleForRoute() }),
+          h('p', { class: 'eyebrow', text: 'Fase 1 · protótipo navegável local' }),
+          h('h1', { text: 'Núcleo de Inovação Tecnológica' }),
+          h('p', { class: 'view-mode-label', text: `Modo ${viewMode()}${isResearcher(user) ? ' · acompanhamento externo do pesquisador' : ' · operação interna institucional'}` }),
         ]),
-        h('div', { class: 'user-card' }, [
-          icon('user'),
-          h('div', {}, [
-            h('strong', { text: user.name }),
-            h('span', { text: user.institutionalId }),
+        h('div', { class: 'topbar-actions' }, [
+          h('div', { class: 'user-card' }, [
+            icon('user'),
+            h('div', {}, [
+              h('strong', { text: user.name }),
+              h('span', { text: `${roles[user.role]} · ${user.notificationEmail || user.email}` }),
+            ]),
           ]),
+          h('button', { class: 'secondary-action', type: 'button', onclick: () => lockSession('Sessão bloqueada manualmente. Faça nova validação MFA para continuar.') }, ['Bloquear sessão']),
         ]),
       ]),
       content,
@@ -773,121 +1628,125 @@ function shell(content) {
   ]);
 }
 
-function searchBox(extraClass = '') {
-  return h('form', {
-    class: `global-search ${extraClass}`,
-    onsubmit: (event) => {
-      event.preventDefault();
-      applySearch(extraClass);
-    },
-  }, [
-    h('span', { text: 'Busca' }),
-    h('input', {
-      type: 'search',
-      value: state.searchDraft,
-      'data-search-box': extraClass,
-      placeholder: 'Buscar por processo, pesquisador, status, documento...',
-      oninput: (event) => {
-        state.searchDraft = event.target.value;
-        state.activeSearchBox = extraClass;
-        applySearch(extraClass);
-      },
-      onkeydown: (event) => {
-        if (event.key === 'Enter') {
-          event.preventDefault();
-          applySearch(extraClass);
-        }
-      },
-    }),
-    h('button', {
-      type: 'submit',
-      title: 'Buscar',
-      class: 'search-trigger',
-    }, ['⌕']),
-    state.searchTerm
-      ? h('button', {
-          type: 'button',
-          title: 'Limpar busca',
-          class: 'search-clear',
-          onclick: () => {
-            state.searchTerm = '';
-            state.searchDraft = '';
-            render();
-          },
-        }, ['×'])
-      : null,
+function securityBanner() {
+  return h('div', { class: 'security-banner' }, [
+    h('div', { class: 'banner-main' }, [
+      h('strong', { text: isResearcher() ? 'Canal institucional protegido' : 'Ambiente demonstrativo com controles de segurança' }),
+      h('span', { text: isResearcher()
+        ? 'As avaliações internas do NIT seguem preservadas. Sua visão mostra o andamento do processo sem expor o avaliador individual.'
+        : 'MFA, bloqueio de sessão, rastreabilidade e avisos de dados sensíveis foram incorporados ao fluxo do protótipo.' }),
+    ]),
+    h('div', { class: 'banner-pills' }, [
+      h('span', { class: 'banner-pill', text: `MFA ${state.mfaVerified ? 'ativo' : 'pendente'}` }),
+      h('span', { class: 'banner-pill', text: isResearcher() ? 'Visão externa' : 'Visão interna' }),
+      h('span', { class: 'banner-pill', text: 'IA assistiva, sem decisão automática' }),
+    ]),
   ]);
 }
 
-function navButton(route, label, iconName) {
-  return h('button', {
-    class: `nav-item ${state.route === route ? 'active' : ''}`,
-    onclick: () => setRoute(route),
-    title: label,
-  }, [icon(iconName), h('span', { text: label })]);
-}
-
-function titleForRoute() {
-  const titles = {
-    dashboard: 'Dashboard por perfil',
-    processo: 'Gestão do processo',
-    submissao: 'Submissão inicial',
-    documentos: 'Biblioteca documental',
-    mensagens: 'Comunicação processual',
-    pendencias: 'Pendências',
-    relatorios: 'Indicadores',
-  };
-  return titles[state.route] || 'NIT';
+function sessionGateView() {
+  const user = currentUser();
+  return h('div', { class: 'session-gate-shell' }, [
+    h('section', { class: 'session-gate' }, [
+      h('div', { class: 'brand gate-brand' }, [
+        h('div', { class: 'brand-mark', text: 'NIT' }),
+        h('div', {}, [
+          h('strong', { text: 'Gerenciador NIT' }),
+          h('span', { text: 'Acesso local protegido por MFA demonstrativo' }),
+        ]),
+      ]),
+      h('div', { class: 'gate-copy' }, [
+        h('p', { class: 'eyebrow', text: 'Segurança e acesso' }),
+        h('h1', { text: 'Validação multifator antes de entrar' }),
+        h('p', { text: 'Este protótipo não exige e-mail institucional, mas simula a governança de acesso com segundo fator, bloqueio de sessão e diretrizes de uso seguro para tramitação de dados processuais.' }),
+      ]),
+      h('label', { class: 'user-switch gate-switch' }, [
+        h('span', { text: 'Perfil selecionado para a sessão' }),
+        h('select', {
+          value: state.currentUserId,
+          onchange: (event) => switchUser(event.target.value),
+        }, state.userList.map((candidate) => h('option', {
+          value: candidate.id,
+          selected: candidate.id === state.currentUserId,
+          text: `${candidate.name} · ${roles[candidate.role]}`,
+        }))),
+      ]),
+      h('div', { class: 'gate-card-row' }, [
+        h('section', { class: 'gate-card' }, [
+          h('p', { class: 'eyebrow', text: 'Identidade ativa' }),
+          h('h2', { text: user.name }),
+          h('p', { text: `${roles[user.role]} · ${user.notificationEmail || user.email}` }),
+          h('div', { class: 'readonly-note security-note', text: state.lockReason || 'Gere um código MFA para entrar nesta sessão local.' }),
+          h('div', { class: 'action-row' }, [
+            h('button', { class: 'primary-action', type: 'button', onclick: issueMfaCode }, ['Gerar código MFA']),
+          ]),
+          state.pendingMfaCode ? h('div', { class: 'mfa-demo-box' }, [
+            h('span', { text: 'Código de demonstração gerado' }),
+            h('strong', { text: state.pendingMfaCode }),
+            h('small', { text: `Emitido às ${state.mfaCodeIssuedAt}. Em produção, isso viraria app autenticador ou provedor homologado.` }),
+          ]) : null,
+          h('form', { class: 'compact-form', onsubmit: validateMfa }, [
+            field('Código MFA', 'codigo', 'text', '000000', true),
+            h('button', { class: 'secondary-action', type: 'submit' }, ['Validar acesso']),
+          ]),
+        ]),
+        h('section', { class: 'gate-card' }, [
+          h('p', { class: 'eyebrow', text: 'Boas práticas reforçadas' }),
+          h('ul', { class: 'attention-list gate-notes' }, [
+            h('li', {}, [h('strong', { text: 'Reporte primeiro' }), h('span', { text: 'Em caso de incidente, comunique liderança e TI antes de qualquer investigação autônoma.' })]),
+            h('li', {}, [h('strong', { text: 'Nada de credenciais em mensagens' }), h('span', { text: 'O app alerta sobre senha, token, CPF e códigos MFA, mantendo o rascunho para edição consciente.' })]),
+            h('li', {}, [h('strong', { text: 'Integrações só homologadas' }), h('span', { text: 'OpenAI, armazenamento e notificações reais devem ficar em backend institucional validado pela TI.' })]),
+          ]),
+        ]),
+      ]),
+    ]),
+  ]);
 }
 
 function dashboardView() {
+  const list = visibleProcesses();
   const metrics = metricData();
+
   return h('section', { class: 'stack' }, [
     h('div', { class: 'metrics-grid' }, [
-      metricCard('Processos visíveis', metrics.visible.length, 'Filtrados conforme o perfil ativo'),
-      metricCard('Pendências abertas', metrics.openPendencies.length, 'Itens aguardando resposta'),
-      metricCard('Processos em atraso', metrics.late.length, 'Com prazo vencido na fase atual'),
-      metricCard('Tempo médio', `${metrics.averageCycleDays} dias`, 'Da abertura à última atualização'),
-      metricCard('Certificados emitidos', metrics.certificates.length, 'Disponíveis para coordenação'),
+      metricCard('Processos visíveis', list.length, 'Filtrados pelo perfil ativo e pela busca'),
+      metricCard('Prazo crítico', metrics.late.length, 'Com fase atual vencida'),
+      metricCard('Pendências abertas', metrics.openPendencies.length, 'Demandas aguardando resposta'),
+      metricCard('Mensagens não lidas', unreadInboxCount(), 'Caixa de entrada do perfil ativo'),
       metricCard('Retrabalho documental', metrics.rework, 'Versões substituídas ou reenviadas'),
+      metricCard('Tempo médio', `${metrics.averageCycleDays} dias`, 'Entre abertura e última atualização'),
     ]),
     h('div', { class: 'split' }, [
-      panel('Fila de trabalho', processCards(metrics.visible)),
-      panel('Atenção imediata', attentionList(metrics)),
+      panel(isResearcher() ? 'Meus processos' : 'Fila prioritária', processCards(list.slice(0, 6))),
+      panel(isResearcher() ? 'Canal institucional' : 'Radar operacional', attentionFeed(metrics)),
     ]),
-  ]);
-}
-
-function metricCard(label, value, note) {
-  return h('article', { class: 'metric' }, [
-    h('span', { text: label }),
-    h('strong', { text: String(value) }),
-    h('small', { text: note }),
   ]);
 }
 
 function processCards(list) {
-  if (!list.length) return [emptyState(state.searchTerm ? 'Nenhum processo encontrado para esta busca.' : 'Nenhum processo disponível para este perfil.')];
-  return list.map((process) => processRow(process));
-}
-
-function processRow(process) {
-  return h('button', { class: 'process-row', onclick: () => selectProcess(process.id) }, [
+  if (!list.length) return [emptyState('Nenhum processo encontrado com este perfil ou termo de busca.')];
+  return list.map((process) => h('button', {
+    class: 'process-row',
+    type: 'button',
+    onclick: () => selectProcess(process.id),
+  }, [
     h('div', {}, [
-      h('strong', { text: process.Titulo_Projeto }),
-      h('span', { text: `${process.ProcessoNIT_ID} · ${process.Pesquisador_Nome}` }),
+      h('strong', { text: process.ProcessoNIT_ID }),
+      h('span', { text: process.Titulo_Projeto }),
+      h('span', { text: `${process.Pesquisador_Nome} · ${process.Programa_Curso}` }),
     ]),
     h('div', { class: 'row-meta' }, [
       statusPill(process.Status_Atual),
-      processPendencyCount(process.ProcessoNIT_ID) ? h('span', { class: 'alert-pill', text: `${processPendencyCount(process.ProcessoNIT_ID)} pend.` }) : null,
+      processPendencyCount(process.ProcessoNIT_ID) ? h('span', { class: 'alert-pill', text: `${processPendencyCount(process.ProcessoNIT_ID)} pendência(s)` }) : null,
+      unreadMessageCount(process.ProcessoNIT_ID) ? h('span', { class: 'alert-pill', text: `${unreadMessageCount(process.ProcessoNIT_ID)} msg` }) : null,
     ]),
-  ]);
+  ]));
 }
 
-function attentionList(metrics) {
+function attentionFeed(metrics) {
   const items = [
     ...metrics.openPendencies.map((pendency) => h('li', {}, [
-      h('strong', { text: pendency.Tipo_Pendencia }),
+      h('strong', { text: 'Pendência aberta' }),
       h('span', { text: `${pendency.ProcessoNIT_ID} · prazo ${formatDate(pendency.Prazo_Resposta)}` }),
     ])),
     ...metrics.late.map((process) => h('li', {}, [
@@ -919,13 +1778,17 @@ function processView() {
         infoItem('Orientador', process.Orientador_Nome),
         infoItem('Programa', process.Programa_Curso),
         infoItem('Produto técnico', process.Tipo_ProdutoTecnico),
-        infoItem('Responsável atual', userName(process.Responsavel_Atual_ID)),
+        infoItem('Responsável atual', maskedResponsibleLabel(process)),
         infoItem('Prazo da fase', formatDate(deadlineForCurrentPhase(process))),
       ]),
       statusEditor(process),
       cycleStepper(process),
-      panel('Operações do Ciclo 1', cycleOneActions(process)),
-      panel('Pré-avaliação AACIIm', aaciimPanel(process)),
+      !isResearcher() ? panel('Operações do Ciclo 1', cycleOneActions(process)) : panel('Canal institucional', [
+        h('div', { class: 'readonly-note', text: 'O acompanhamento externo mostra andamento, pendências e comunicações oficiais sem expor o avaliador individual do NIT.' }),
+      ]),
+      !isResearcher() ? panel('Pré-avaliação AACIIm', aaciimPanel(process)) : panel('Situação da avaliação', [
+        h('div', { class: 'readonly-note', text: `Situação atual: ${process.Status_Atual}. Quando houver devolutiva formal do NIT, ela aparecerá em Mensagens e Notificações.` }),
+      ]),
       panel('Linha do tempo', timeline(process.ProcessoNIT_ID)),
     ]),
   ]);
@@ -933,7 +1796,9 @@ function processView() {
 
 function cycleOneActions(process) {
   const assigned = process.MembroNIT_Atribuido_ID ? userName(process.MembroNIT_Atribuido_ID) : 'Não atribuído';
-  const nitMembers = users.filter((user) => user.role === 'nit');
+  const nitMembers = state.userList.filter((user) => user.role === 'nit');
+  const selectedMember = process.MembroNIT_Atribuido_ID || '';
+  const capacityRows = nitCapacityStats();
   return [
     h('div', { class: 'workflow-box' }, [
       infoItem('Membro NIT atribuído', assigned),
@@ -941,20 +1806,38 @@ function cycleOneActions(process) {
       infoItem('PDF do parecer', process.ParecerInicial_Numero ? 'Pronto para geração' : 'Será gerado ao emitir o parecer'),
     ]),
     canAssignNitMember()
-      ? h('label', { class: 'inline-field' }, [
-          h('span', { text: 'Atribuir membro do NIT' }),
-          h('select', {
-            onchange: (event) => {
-              if (event.target.value) assignNitMember(process.id, event.target.value);
-            },
+      ? h('form', {
+          class: 'status-editor reassignment-form',
+          onsubmit: (event) => {
+            event.preventDefault();
+            const memberId = new FormData(event.currentTarget).get('nit_member');
+            if (memberId) assignNitMember(process.id, memberId);
+          },
+        }, [
+          h('div', { class: 'nit-capacity-board' }, capacityRows.map((item) => h('div', {
+            class: `capacity-card ${item.id === selectedMember ? 'selected' : ''}`,
           }, [
-            h('option', { value: '', text: 'Selecione...' }),
-            ...nitMembers.map((member) => h('option', {
-              value: member.id,
-              selected: member.id === process.MembroNIT_Atribuido_ID,
-              text: member.name,
-            })),
+            h('strong', { text: item.name }),
+            h('span', { text: `Carga ativa: ${item.active}` }),
+            h('span', { text: `Atrasadas: ${item.late}` }),
+            h('span', { text: `Taxa de atraso: ${item.rate}%` }),
+          ]))),
+          h('label', {}, [
+            h('span', { text: process.MembroNIT_Atribuido_ID ? 'Redirecionar demanda para outro membro do NIT' : 'Atribuir membro do NIT' }),
+            h('select', { name: 'nit_member', required: true }, [
+              h('option', { value: '', text: 'Selecione...' }),
+              ...nitMembers.map((member) => {
+                const load = activeNitTaskCount(member.id);
+                const late = lateNitTaskCount(member.id);
+                return h('option', {
+                  value: member.id,
+                  selected: member.id === selectedMember,
+                  text: `${member.name} · carga ${load} · atrasadas ${late}`,
+                });
+              }),
+            ]),
           ]),
+          h('button', { class: 'primary-action', type: 'submit' }, [process.MembroNIT_Atribuido_ID ? 'Confirmar redirecionamento' : 'Confirmar atribuição']),
         ])
       : null,
     h('div', { class: 'action-row' }, [
@@ -987,6 +1870,9 @@ function cycleOneActions(process) {
 }
 
 function statusEditor(process) {
+  if (isResearcher()) {
+    return h('div', { class: 'readonly-note', text: 'A visão externa do pesquisador acompanha fase e status sem expor operações internas do NIT.' });
+  }
   if (!canEditGlobalStatus()) {
     return h('div', { class: 'readonly-note', text: 'Status global: edição restrita ao Coordenador NIT e Administrador.' });
   }
@@ -1053,7 +1939,7 @@ function aaciimPanel(process) {
       h('span', { text: 'Recomendação IA' }),
       h('strong', { text: record.GPT_RecomendacaoPreliminar }),
       h('span', { text: 'Decisão humana' }),
-      h('strong', { text: record.Humano_DecisaoFinal }),
+      h('strong', { text: record.Humano_DecisaoFinal || 'Pendente' }),
     ]),
   ];
 }
@@ -1065,7 +1951,7 @@ function timeline(processId) {
     h('li', {}, [
       h('time', { text: formatDate(item.date) }),
       h('strong', { text: item.label }),
-      h('span', { text: item.detail }),
+      h('span', { text: sanitizeForResearcher(item.detail) }),
     ])
   ))];
 }
@@ -1096,22 +1982,30 @@ function documentsView() {
   const docs = state.documentList.filter((doc) => allowedIds.includes(doc.ProcessoNIT_ID) && matchesDocumentSearch(doc));
   const latestDocs = latestDocuments(docs);
   const uploadableProcesses = visibleProcesses().filter((process) => canUploadForProcess(process));
+  ensureDocumentUploadDraft(uploadableProcesses);
   return h('section', { class: 'stack' }, [
     h('div', { class: 'split' }, [
       panel('Biblioteca documental', latestDocs.length ? latestDocs.map((doc) => {
         const versions = documentVersions(doc.ProcessoNIT_ID, doc.Tipo_Documento);
+        const originMessage = doc.Origem_Mensagem_ID ? messageById(doc.Origem_Mensagem_ID) : null;
         return h('article', { class: 'document-card' }, [
           h('div', { class: 'message-head' }, [
             h('div', {}, [
               h('strong', { text: `${doc.ProcessoNIT_ID} · ${doc.Tipo_Documento}` }),
               h('span', { text: `${doc.Ciclo} · ${doc.Nome_Arquivo}` }),
             ]),
-            statusPill(doc.Status_Documento),
+            h('div', { class: 'action-row' }, [
+              doc.Origem === 'Mensagem' ? h('span', { class: 'origin-pill', text: 'Origem: mensagem' }) : null,
+              statusPill(doc.Status_Documento),
+            ]),
           ]),
           h('div', { class: 'doc-meta' }, [
             infoItem('Versão atual', `v${doc.Versao}`),
-            infoItem('Enviado por', userName(doc.EnviadoPor_ID)),
+            infoItem('Enviado por', displayActorName(doc.EnviadoPor_ID)),
             infoItem('Upload', formatDate(doc.Data_Upload)),
+            infoItem('Origem', doc.Origem || 'Upload direto'),
+            infoItem('Mensagem de origem', originMessage?.Assunto || 'Não aplicável'),
+            infoItem('Referência', doc.Origem_Mensagem_ID || 'Não aplicável'),
           ]),
           h('details', { class: 'version-history' }, [
             h('summary', { text: `Histórico de versões (${versions.length})` }),
@@ -1119,20 +2013,38 @@ function documentsView() {
               h('strong', { text: `v${version.Versao}` }),
               h('span', { text: version.Nome_Arquivo }),
               h('span', { text: formatDate(version.Data_Upload) }),
-              h('span', { text: version.Status_Documento }),
+              h('span', { text: `${version.Status_Documento}${version.Origem === 'Mensagem' ? ' · via mensagem' : ''}` }),
             ]))),
           ]),
         ]);
       }) : [emptyState('Nenhum documento disponível para este perfil.')]),
       panel('Enviar documento', uploadableProcesses.length ? [
-        h('form', { class: 'compact-form', onsubmit: uploadDocument }, [
+        h('form', { class: 'compact-form', 'data-document-upload-form': 'true', onsubmit: uploadDocument }, [
           selectField('Processo', 'processo', uploadableProcesses.map((process) => `${process.ProcessoNIT_ID}|${process.Titulo_Projeto}`), (option) => {
             const [id, title] = option.split('|');
-            return h('option', { value: id, text: `${id} · ${title}` });
+            return h('option', { value: id, selected: id === state.documentUploadDraft.processo, text: `${id} · ${title}` });
           }),
-          selectField('Ciclo', 'ciclo', ['Ciclo 1', 'Ciclo 2', 'Ciclo 3']),
-          selectField('Tipo de documento', 'tipo_documento', documentTypeOptions()),
-          field('Arquivo', 'arquivo', 'file', '', true),
+          selectField('Ciclo', 'ciclo', ['Ciclo 1', 'Ciclo 2', 'Ciclo 3'], null, state.documentUploadDraft.ciclo),
+          selectField('Tipo de documento', 'tipo_documento', documentTypeOptions(), null, state.documentUploadDraft.tipo_documento),
+          h('label', {}, [
+            h('span', { text: 'Arquivo' }),
+            h('input', {
+              name: 'arquivo',
+              type: 'file',
+              required: true,
+              onchange: (event) => {
+                const file = event.target.files?.[0] || null;
+                state.documentUploadDraft.file = file;
+                state.documentUploadDraft.fileName = file?.name || '';
+                state.documentUploadWarning = '';
+                state.documentSensitiveOverrideReady = false;
+              },
+            }),
+          ]),
+          state.documentUploadDraft.fileName ? h('div', { class: 'readonly-note', text: `Arquivo selecionado: ${state.documentUploadDraft.fileName}` }) : null,
+          state.documentUploadWarning ? inlineWarning(state.documentUploadWarning, state.documentSensitiveOverrideReady ? [
+            h('button', { class: 'secondary-action warning-action', type: 'button', onclick: () => uploadDocument(null, true) }, ['Enviar mesmo assim']),
+          ] : []) : null,
           h('button', { class: 'primary-action', type: 'submit' }, ['Enviar / criar nova versão']),
         ]),
         h('div', { class: 'readonly-note', text: 'Se já existir um documento do mesmo tipo para o mesmo processo, o sistema cria automaticamente uma nova versão e preserva a anterior.' }),
@@ -1152,44 +2064,152 @@ function documentsView() {
 function messagesView() {
   const allowedIds = visibleProcesses().map((process) => process.ProcessoNIT_ID);
   const rows = state.messageList.filter((message) => allowedIds.includes(message.ProcessoNIT_ID) && matchesMessageSearch(message));
-  const visibleUsers = users.filter((user) => user.id !== currentUser().id);
+  const visibleUsers = visibleRecipientsForCompose();
+  ensureComposeDraft(allowedIds, visibleUsers);
   return h('section', { class: 'message-board' }, [
-    panel('Comunicações oficiais', rows.length ? rows.map((message) => h('article', { class: `message ${message.Lida ? '' : 'unread'}` }, [
-      h('div', { class: 'message-head' }, [
-        h('div', {}, [
-          h('strong', { text: message.Assunto }),
-          h('span', { text: `${message.ProcessoNIT_ID} · ${message.Ciclo} · ${formatDate(message.Data_Envio)}` }),
+    panel('Comunicações oficiais', rows.length ? rows.map((message) => {
+      ensureReplyDraft(message);
+      const replyParent = message.Mensagem_Pai_ID ? messageById(message.Mensagem_Pai_ID) : null;
+      const draft = state.replyDrafts[message.Mensagem_ID] || null;
+      return h('article', { class: `message ${message.Lida ? '' : 'unread'}` }, [
+        h('div', { class: 'message-head' }, [
+          h('div', {}, [
+            h('strong', { text: message.Assunto }),
+            h('span', { text: `${message.ProcessoNIT_ID} · ${message.Ciclo} · ${formatDate(message.Data_Envio)}` }),
+          ]),
+          !message.Lida ? h('button', {
+            class: 'ghost-action',
+            type: 'button',
+            onclick: () => markMessageAsRead(message.Mensagem_ID),
+          }, ['Marcar como lida']) : null,
         ]),
-        !message.Lida ? h('button', {
-          class: 'ghost-action',
-          type: 'button',
-          onclick: () => markMessageAsRead(message.Mensagem_ID),
-        }, ['Marcar como lida']) : null,
-      ]),
-      h('p', { text: message.Corpo_Mensagem }),
-      h('small', { text: `${userName(message.Remetente_ID)} → ${userName(message.Destinatario_ID)}` }),
-      message.Pendencia_ID ? h('small', { text: `Vinculada à pendência ${message.Pendencia_ID}` }) : null,
-    ])) : [emptyState('Nenhuma mensagem disponível para este perfil.')]),
-    panel('Nova mensagem', [
+        replyParent ? h('div', { class: 'reply-link' }, [
+          h('strong', { text: 'Em resposta a' }),
+          h('span', { text: `${replyParent.Assunto}` }),
+        ]) : null,
+        h('p', { text: sanitizeForResearcher(message.Corpo_Mensagem) }),
+        h('small', { text: `${displayActorName(message.Remetente_ID)} → ${displayActorName(message.Destinatario_ID)}` }),
+        message.Pendencia_ID ? h('small', { text: `Vinculada à pendência ${message.Pendencia_ID}` }) : null,
+        message.Anexo?.name ? h('div', { class: 'message-attachment' }, [
+          h('strong', { text: 'Anexo' }),
+          h('span', { text: `${message.Anexo.name} · ${message.Anexo.type || 'arquivo'} · ${Math.max(1, Math.round((message.Anexo.size || 0) / 1024))} KB` }),
+          message.Anexo.registeredInLibrary ? h('span', { text: `Registrado também na Biblioteca documental como ${message.Anexo.documentType}.` }) : null,
+        ]) : null,
+        h('div', { class: 'action-row' }, [
+          h('button', {
+            class: 'ghost-action',
+            type: 'button',
+            onclick: () => {
+              state.replyToMessageId = state.replyToMessageId === message.Mensagem_ID ? '' : message.Mensagem_ID;
+              state.replyWarning = '';
+              state.replySensitiveOverrideReady = false;
+              render();
+            },
+          }, [state.replyToMessageId === message.Mensagem_ID ? 'Fechar resposta' : 'Responder']),
+        ]),
+        state.replyToMessageId === message.Mensagem_ID && draft ? h('form', {
+          class: 'compact-form reply-form',
+          onsubmit: (event) => {
+            event.preventDefault();
+            addReplyMessage(message.Mensagem_ID);
+          },
+        }, [
+          h('div', { class: 'reply-context readonly-note' }, [
+            h('strong', { text: 'Resposta vinculada' }),
+            h('span', { text: `A comunicação ficará ligada à mensagem ${message.Mensagem_ID}.` }),
+          ]),
+          field('Assunto', 'reply_assunto', 'text', '', true, draft.assunto),
+          textArea('Resposta', 'reply_mensagem', 'Escreva a resposta oficial.', draft.mensagem),
+          h('label', {}, [
+            h('span', { text: 'Anexar documento' }),
+            h('input', {
+              type: 'file',
+              name: 'reply_anexo',
+              onchange: (event) => {
+                const file = event.target.files?.[0] || null;
+                draft.anexo = file;
+                draft.anexoNome = file?.name || '';
+                state.replyWarning = '';
+                state.replySensitiveOverrideReady = false;
+              },
+            }),
+          ]),
+          draft.anexoNome ? h('div', { class: 'readonly-note', text: `Anexo selecionado: ${draft.anexoNome}` }) : null,
+          h('label', { class: 'check-row' }, [
+            h('input', {
+              type: 'checkbox',
+              checked: draft.registrar_biblioteca,
+              onchange: (event) => {
+                draft.registrar_biblioteca = event.target.checked;
+              },
+            }),
+            h('span', { text: 'Registrar este anexo também na Biblioteca documental' }),
+          ]),
+          draft.registrar_biblioteca ? selectField('Tipo documental do anexo', 'reply_tipo_documento_anexo', documentTypeOptions(), null, draft.tipo_documento_anexo) : null,
+          state.replyWarning && state.replyToMessageId === message.Mensagem_ID ? inlineWarning(state.replyWarning, state.replySensitiveOverrideReady ? [
+            h('button', { class: 'secondary-action warning-action', type: 'button', onclick: () => addReplyMessage(message.Mensagem_ID, true) }, ['Enviar mesmo assim']),
+          ] : []) : null,
+          h('div', { class: 'action-row' }, [
+            h('button', { class: 'primary-action', type: 'submit' }, ['Enviar resposta']),
+          ]),
+        ]) : null,
+      ]);
+    }) : [emptyState('Nenhuma mensagem disponível para este perfil.')]),
+    panel('Nova mensagem', canCreateMessage() ? [
       h('form', { class: 'compact-form', onsubmit: addMessageFromForm }, [
-        selectField('Processo', 'processo', allowedIds),
-        selectField('Ciclo', 'ciclo', ['Ciclo 1', 'Ciclo 2', 'Ciclo 3']),
-        selectField('Destinatário', 'destinatario', visibleUsers.map((user) => `${user.id}|${user.name}`), (option) => {
+        selectField('Processo', 'processo', allowedIds, null, state.composeDraft.processo),
+        selectField('Ciclo', 'ciclo', ['Ciclo 1', 'Ciclo 2', 'Ciclo 3'], null, state.composeDraft.ciclo),
+        !isResearcher() ? selectField('Destinatário', 'destinatario', visibleUsers.map((user) => `${user.id}|${displayActorName(user.id)}`), (option) => {
           const [id, name] = option.split('|');
-          return h('option', { value: id, text: name });
-        }),
-        selectField('Tipo', 'tipo', ['Solicitação de ajuste', 'Resposta', 'Esclarecimento', 'Devolutiva técnica', 'Devolutiva jurídica', 'Registro de decisão']),
-        field('Assunto', 'assunto', 'text', 'Atualização do processo'),
-        textArea('Mensagem', 'mensagem', 'Escreva a comunicação oficial vinculada ao processo.'),
+          return h('option', { value: id, selected: id === state.composeDraft.destinatario, text: name });
+        }) : h('div', { class: 'readonly-note', text: 'As mensagens do pesquisador são roteadas internamente para o canal responsável sem revelar o avaliador individual.' }),
+        selectField('Tipo', 'tipo', ['Solicitação de ajuste', 'Resposta', 'Esclarecimento', 'Devolutiva técnica', 'Devolutiva jurídica', 'Registro de decisão'], null, state.composeDraft.tipo),
+        field('Assunto', 'assunto', 'text', 'Atualização do processo', true, state.composeDraft.assunto),
+        textArea('Mensagem', 'mensagem', 'Escreva a comunicação oficial vinculada ao processo.', state.composeDraft.mensagem),
+        h('label', {}, [
+          h('span', { text: 'Anexar documento' }),
+          h('input', {
+            type: 'file',
+            name: 'anexo',
+            onchange: (event) => {
+              const file = event.target.files?.[0] || null;
+              state.composeDraft.anexo = file;
+              state.composeDraft.anexoNome = file?.name || '';
+              state.composeMessageWarning = '';
+              state.composeSensitiveOverrideReady = false;
+            },
+          }),
+        ]),
+        state.composeDraft.anexoNome ? h('div', { class: 'readonly-note', text: `Anexo selecionado: ${state.composeDraft.anexoNome}` }) : null,
         h('label', { class: 'check-row' }, [
-          h('input', { type: 'checkbox', name: 'gera_pendencia' }),
+          h('input', {
+            type: 'checkbox',
+            checked: state.composeDraft.registrar_biblioteca,
+            onchange: (event) => {
+              state.composeDraft.registrar_biblioteca = event.target.checked;
+            },
+          }),
+          h('span', { text: 'Registrar este anexo também na Biblioteca documental' }),
+        ]),
+        state.composeDraft.registrar_biblioteca ? selectField('Tipo documental do anexo', 'tipo_documento_anexo', documentTypeOptions(), null, state.composeDraft.tipo_documento_anexo) : null,
+        h('label', { class: 'check-row' }, [
+          h('input', {
+            type: 'checkbox',
+            checked: state.composeDraft.gera_pendencia,
+            onchange: (event) => {
+              state.composeDraft.gera_pendencia = event.target.checked;
+            },
+          }),
           h('span', { text: 'Gerar pendência vinculada' }),
         ]),
-        selectField('Tipo da pendência', 'tipo_pendencia', ['Documental', 'Técnica', 'Jurídica', 'Metodológica', 'Administrativa', 'Outra']),
-        field('Prazo da pendência', 'prazo', 'date', ''),
+        selectField('Tipo da pendência', 'tipo_pendencia', ['Documental', 'Técnica', 'Jurídica', 'Metodológica', 'Administrativa', 'Outra'], null, state.composeDraft.tipo_pendencia),
+        field('Prazo da pendência', 'prazo', 'date', '', false, state.composeDraft.prazo),
+        state.composeMessageWarning ? inlineWarning(state.composeMessageWarning, state.composeSensitiveOverrideReady ? [
+          h('button', { class: 'secondary-action warning-action', type: 'button', onclick: () => addMessageFromForm(new Event('submit'), true) }, ['Enviar mesmo assim']),
+        ] : []) : null,
         h('button', { class: 'primary-action', type: 'submit' }, ['Enviar mensagem']),
       ]),
-    ]),
+    ] : [emptyState('Este perfil não pode criar mensagens nesta etapa.')]),
   ]);
 }
 
@@ -1207,7 +2227,7 @@ function pendenciesView() {
           statusPill(pendency.Status_Pendencia),
         ]),
         h('p', { text: pendency.Descricao_Pendencia }),
-        h('small', { text: `Responsável: ${userName(pendency.Responsavel_Resposta_ID)}` }),
+        h('small', { text: `Responsável: ${displayActorName(pendency.Responsavel_Resposta_ID)}` }),
         h('div', { class: 'action-row' }, [
           h('button', {
             class: 'ghost-action',
@@ -1236,7 +2256,7 @@ function pendenciesView() {
           selectField('Tipo', 'tipo', ['Documental', 'Técnica', 'Jurídica', 'Metodológica', 'Administrativa', 'Outra']),
           textArea('Descrição', 'descricao', 'Descreva claramente o que precisa ser respondido ou corrigido.'),
           field('Prazo', 'prazo', 'date', '', true),
-          selectField('Responsável', 'responsavel', users.map((user) => `${user.id}|${user.name}`), (option) => {
+          selectField('Responsável', 'responsavel', state.userList.map((user) => `${user.id}|${user.name}`), (option) => {
             const [id, name] = option.split('|');
             return h('option', { value: id, text: name });
           }),
@@ -1253,6 +2273,9 @@ function pendenciesView() {
 
 function reportsView() {
   const metrics = metricData();
+  const nitRows = nitPerformanceRows();
+  const bestNit = nitRows[0] || null;
+  const attentionNit = [...nitRows].sort((a, b) => b.delayRate - a.delayRate)[0] || null;
   return h('section', { class: 'stack' }, [
     h('div', { class: 'section-head' }, [
       h('div', {}, [
@@ -1271,6 +2294,11 @@ function reportsView() {
       metricCard('Certificados emitidos', metrics.certificates.length, 'Ciclo final concluído'),
       metricCard('Retrabalho documental', metrics.rework, 'Versões substituídas ou reenviadas'),
     ]),
+    h('div', { class: 'metrics-grid' }, [
+      metricCard('Melhor índice NIT', bestNit ? `${bestNit.name}: ${bestNit.score}` : 'Sem dados', 'Leitura sintética de desempenho'),
+      metricCard('Maior atenção NIT', attentionNit ? `${attentionNit.name}: ${attentionNit.delayRate}%` : 'Sem dados', 'Maior taxa de atraso ativa'),
+      metricCard('Pareceres emitidos', nitRows.reduce((sum, row) => sum + row.opinions, 0), 'Produção acumulada do NIT'),
+    ]),
     panel('Distribuição por fase', [
       h('div', { class: 'bar-list' }, phaseOptions.map((phase) => {
         const count = metrics.visible.filter((process) => process.Fase_Atual === phase).length;
@@ -1281,17 +2309,231 @@ function reportsView() {
         ]);
       })),
     ]),
+    panel('Performance por membro do NIT', [
+      table(
+        ['Membro', 'Carga ativa', 'Em dia', 'Atrasadas', 'Taxa atraso', 'Pareceres', 'Concluídos', 'Índice', 'Sinal'],
+        nitRows.map((row) => [
+          row.name,
+          row.active,
+          row.onTrack,
+          row.late,
+          `${row.delayRate}%`,
+          row.opinions,
+          row.completed,
+          row.score,
+          row.performance,
+        ])
+      ),
+      h('div', { class: 'performance-legend' }, nitRows.map((row) =>
+        h('div', { class: 'performance-chip-row' }, [
+          h('strong', { text: row.name }),
+          h('span', { class: `status-pill ${performanceTone(row.performance)}`, text: row.performance }),
+          h('span', { text: `Carga ${row.active} · atraso ${row.delayRate}% · índice ${row.score}` }),
+        ])
+      )),
+      h('div', { class: 'readonly-note' }, [
+        'A distribuição automática usa carga ativa. Já o acompanhamento gerencial destaca atraso, entregas e um índice sintético de performance para apoiar a diretoria.'
+      ]),
+    ]),
+  ]);
+}
+
+function notificationsView() {
+  const rows = visibleNotifications();
+  return h('section', { class: 'stack' }, [
+    h('div', { class: 'section-head' }, [
+      h('div', {}, [
+        h('p', { class: 'eyebrow', text: isResearcher() ? 'Acompanhamento do pesquisador' : 'Alertas operacionais' }),
+        h('h2', { text: isResearcher() ? 'Atualizações do seu processo' : 'Central de notificações' }),
+      ]),
+      rows.some((item) => !item.read)
+        ? h('button', { class: 'secondary-action', type: 'button', onclick: markAllNotificationsRead }, ['Marcar tudo como lido'])
+        : null,
+    ]),
+    rows.length ? rows.map((item) =>
+      h('article', { class: `message notification-card ${item.read ? '' : 'unread'}` }, [
+        h('div', { class: 'message-head' }, [
+          h('div', {}, [
+            h('strong', { text: item.title }),
+            h('span', { text: `${item.ProcessoNIT_ID || 'Geral'} · ${formatDate(item.date)} · ${item.time}` }),
+          ]),
+          !item.read ? h('button', {
+            class: 'ghost-action',
+            type: 'button',
+            onclick: () => markNotificationRead(item.Notificacao_ID),
+          }, ['Marcar como lida']) : null,
+        ]),
+        h('p', { text: sanitizeForResearcher(item.detail) }),
+        h('div', { class: 'action-row' }, [
+          item.ProcessoNIT_ID ? h('button', {
+            class: 'secondary-action',
+            type: 'button',
+            onclick: () => {
+              const process = state.processList.find((candidate) => candidate.ProcessoNIT_ID === item.ProcessoNIT_ID);
+              if (process) selectProcess(process.id);
+            },
+          }, ['Abrir processo']) : null,
+          item.route === 'mensagens' ? h('button', {
+            class: 'secondary-action',
+            type: 'button',
+            onclick: () => setRoute('mensagens'),
+          }, ['Ir para mensagens']) : null,
+        ]),
+      ])
+    ) : [emptyState(isResearcher()
+      ? 'Nenhuma atualização ainda. Quando houver movimentações relevantes no seu processo, elas aparecerão aqui.'
+      : 'Nenhuma notificação operacional no momento.'
+    )],
+  ]);
+}
+
+function securityView() {
+  const visibleProcessIds = visibleProcesses().map((process) => process.ProcessoNIT_ID);
+  const incidentRows = state.incidentList.filter((incident) => !incident.ProcessoNIT_ID || visibleProcessIds.includes(incident.ProcessoNIT_ID));
+  const auditRows = state.auditList.filter((entry) => !entry.ProcessoNIT_ID || visibleProcessIds.includes(entry.ProcessoNIT_ID));
+  const timeLeft = Math.max(0, Math.floor((SESSION_TIMEOUT_MS - (Date.now() - state.lastActivityAt)) / 1000));
+
+  return h('section', { class: 'stack' }, [
+    h('div', { class: 'metrics-grid' }, [
+      metricCard('MFA da sessão', state.mfaVerified ? 'Validado' : 'Pendente', 'Segundo fator exigido antes do acesso'),
+      metricCard('Bloqueio de sessão', state.sessionLocked ? 'Ativo' : 'Pronto', 'Bloqueio manual ou por inatividade'),
+      metricCard('Expiração estimada', `${timeLeft}s`, 'Contagem até bloqueio por inatividade'),
+      metricCard('Incidentes reportados', incidentRows.length, 'Registros de segurança visíveis ao perfil'),
+      metricCard('Ações auditadas', auditRows.length, 'Trilha de auditoria local do protótipo'),
+      metricCard('Armazenamento atual', 'Local', 'Persistência de protótipo em navegador'),
+      metricCard('Status de IA', 'Controlada', 'Apenas uso homologado deve ir para produção'),
+    ]),
+    h('div', { class: 'split' }, [
+      panel('Reportar incidente', [
+        h('div', { class: 'readonly-note security-note', text: 'Diretriz institucional: reporte primeiro. Investigue depois.' }),
+        h('form', { class: 'compact-form', onsubmit: addIncidentFromForm }, [
+          selectField('Categoria', 'categoria', ['Phishing', 'Credencial', 'Upload indevido', 'IA/integração externa', 'Dispositivo', 'Outro']),
+          selectField('Processo relacionado', 'processo', [''].concat(visibleProcessIds), (option) => h('option', { value: option, text: option || 'Sem processo específico' })),
+          textArea('Resumo do incidente', 'resumo', 'Descreva o ocorrido, mesmo se o clique ou envio foi acidental.'),
+          textArea('Ação imediata', 'acao_imediata', 'Ex.: comuniquei a TI, bloqueei a sessão, troquei senha, suspendi uso do arquivo.'),
+          h('button', { class: 'primary-action', type: 'submit' }, ['Registrar incidente']),
+        ]),
+      ]),
+      panel('Controles recomendados', [
+        h('ul', { class: 'attention-list' }, [
+          h('li', {}, [h('strong', { text: 'MFA em todos os acessos' }), h('span', { text: 'Sem obrigar e-mail institucional, mas com segundo fator obrigatório.' })]),
+          h('li', {}, [h('strong', { text: 'Somente ferramentas homologadas' }), h('span', { text: 'Integrações externas e IA devem passar pela TI antes de produção.' })]),
+          h('li', {}, [h('strong', { text: 'Sessão bloqueável' }), h('span', { text: 'Tela bloqueada ao se ausentar ou por inatividade, reduzindo risco operacional.' })]),
+          h('li', {}, [h('strong', { text: 'Dados mínimos no protótipo' }), h('span', { text: 'Enquanto for demo pública, usar apenas dados fictícios e sem anexos sensíveis reais.' })]),
+        ]),
+      ]),
+    ]),
+    table(['ID', 'Categoria', 'Processo', 'Reportado por', 'Data', 'Status', 'Ação imediata'], incidentRows.map((incident) => [
+      incident.Incidente_ID,
+      incident.Categoria,
+      incident.ProcessoNIT_ID || 'Geral',
+      userName(incident.ReportadoPor_ID),
+      `${formatDate(incident.Data_Registro)} ${incident.Hora_Registro}`,
+      incident.Status,
+      incident.Acao_Imediata,
+    ])),
+    panel('Trilha de auditoria', auditRows.length ? [
+      table(['Quando', 'Usuário', 'Ação', 'Processo', 'Detalhe'], auditRows.slice(0, 20).map((entry) => [
+        entry.DataHora,
+        entry.Usuario_Nome,
+        entry.Acao,
+        entry.ProcessoNIT_ID || 'Geral',
+        entry.Detalhe,
+      ])),
+      h('div', { class: 'readonly-note', text: 'Esta trilha é local e demonstrativa. Em produção, a auditoria deve ir para backend institucional, com retenção e controle de integridade.' }),
+    ] : [emptyState('Nenhuma ação auditada ainda nesta sessão de demonstração.')]),
+  ]);
+}
+
+function accountView() {
+  const user = currentUser();
+  const settings = user.notifications || { email: true, inApp: true, dailyDigest: false };
+  return h('section', { class: 'stack' }, [
+    h('div', { class: 'guided-form account-layout' }, [
+      h('div', { class: 'form-intro' }, [
+        h('p', { class: 'eyebrow', text: 'Cadastro local do protótipo' }),
+        h('h2', { text: 'Conta e notificações' }),
+        h('p', { text: 'Aqui já conseguimos simular o vínculo de uma conta a um e-mail para avisos operacionais. No ambiente institucional, isso depois deve migrar para autenticação real e serviço de notificação homologado.' }),
+        h('div', { class: 'readonly-note security-note', text: 'Neste MVP, o cadastro é local e serve para demonstrar preferências de aviso por perfil, inclusive para coordenador, administrador, jurídico e pesquisador.' }),
+      ]),
+      h('form', { class: 'compact-form', onsubmit: saveAccountSettings }, [
+        field('Nome do usuário', 'name_display', 'text', '', false, user.name),
+        field('Identificador', 'institutional_id', 'text', '', false, user.institutionalId || ''),
+        field('E-mail para notificações', 'notification_email', 'email', 'nome@exemplo.com', true, user.notificationEmail || user.email || ''),
+        h('label', { class: 'check-row' }, [
+          h('input', { type: 'checkbox', name: 'notif_in_app', checked: settings.inApp }),
+          h('span', { text: 'Receber notificações dentro do app' }),
+        ]),
+        h('label', { class: 'check-row' }, [
+          h('input', { type: 'checkbox', name: 'notif_email', checked: settings.email }),
+          h('span', { text: 'Receber notificações por e-mail' }),
+        ]),
+        h('label', { class: 'check-row' }, [
+          h('input', { type: 'checkbox', name: 'notif_digest', checked: settings.dailyDigest }),
+          h('span', { text: 'Receber resumo diário' }),
+        ]),
+        h('button', { class: 'primary-action', type: 'submit' }, ['Salvar preferências']),
+      ]),
+    ]),
+    h('div', { class: 'metrics-grid' }, [
+      metricCard('Mensagens não lidas', unreadInboxCount(user), 'Mostradas também no badge da barra lateral'),
+      metricCard('Canal principal', settings.email ? 'E-mail' : 'In-app', 'Preferência atual de notificação'),
+      metricCard('Conta ativa', roles[user.role], 'Perfil local selecionado no protótipo'),
+    ]),
   ]);
 }
 
 function loadByMember() {
-  const counts = {};
-  visibleProcesses().forEach((process) => {
-    const name = userName(process.Responsavel_Atual_ID);
-    counts[name] = (counts[name] || 0) + 1;
-  });
-  const [name, count] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0] || ['Sem carga', 0];
+  const nitMembers = state.userList.filter((user) => user.role === 'nit');
+  const counts = nitMembers.map((member) => [member.name, activeNitTaskCount(member.id)]);
+  const [name, count] = counts.sort((a, b) => b[1] - a[1])[0] || ['Sem carga', 0];
   return `${name}: ${count}`;
+}
+
+function nitPerformanceRows() {
+  const scopedProcesses = canExportReports() ? state.processList : visibleProcesses();
+  return state.userList
+    .filter((user) => user.role === 'nit')
+    .map((member) => {
+      const assigned = scopedProcesses.filter((process) => process.MembroNIT_Atribuido_ID === member.id);
+      const active = assigned.filter((process) => !['Concluído', 'Arquivado'].includes(process.Fase_Atual)).length;
+      const late = assigned.filter((process) => !['Concluído', 'Arquivado'].includes(process.Fase_Atual) && isLate(process)).length;
+      const onTrack = Math.max(0, active - late);
+      const opinions = assigned.filter((process) => Boolean(process.ParecerInicial_Numero)).length;
+      const completed = assigned.filter((process) => process.Fase_Atual === 'Concluído' || process.CertificadoFinal_Numero).length;
+      const delayRate = active ? Math.round((late / active) * 100) : 0;
+      const score = Math.max(0, 100 - delayRate * 0.6 - Math.max(0, active - onTrack) * 2 + completed * 4);
+      const performance =
+        delayRate >= 60 ? 'Crítico' :
+        delayRate >= 30 ? 'Atenção' :
+        score >= 85 ? 'Bom' :
+        'Estável';
+
+      return {
+        id: member.id,
+        name: member.name,
+        active,
+        late,
+        onTrack,
+        opinions,
+        completed,
+        delayRate,
+        score: Math.round(score),
+        performance,
+      };
+    })
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      if (left.delayRate !== right.delayRate) return left.delayRate - right.delayRate;
+      return left.name.localeCompare(right.name, 'pt-BR');
+    });
+}
+
+function performanceTone(label) {
+  if (label === 'Crítico') return 'danger';
+  if (label === 'Atenção') return 'warn';
+  if (label === 'Bom') return 'ok';
+  return 'info';
 }
 
 function panel(title, children) {
@@ -1313,24 +2555,24 @@ function infoItem(label, value) {
   ]);
 }
 
-function field(label, name, type, placeholder, forceRequired = false) {
+function field(label, name, type, placeholder, forceRequired = false, value = '') {
   return h('label', {}, [
     h('span', { text: label }),
-    h('input', { name, type, placeholder, required: forceRequired || type !== 'file' }),
+    h('input', { name, type, placeholder, required: forceRequired || type !== 'file', value: type === 'file' ? null : value }),
   ]);
 }
 
-function textArea(label, name, placeholder) {
+function textArea(label, name, placeholder, value = '') {
   return h('label', {}, [
     h('span', { text: label }),
-    h('textarea', { name, placeholder, required: true }),
+    h('textarea', { name, placeholder, required: true }, [value]),
   ]);
 }
 
-function selectField(label, name, options, optionBuilder = null) {
+function selectField(label, name, options, optionBuilder = null, selectedValue = '') {
   return h('label', {}, [
     h('span', { text: label }),
-    h('select', { name, required: true }, options.map((option) => optionBuilder ? optionBuilder(option) : h('option', { value: option, text: option }))),
+    h('select', { name, required: true }, options.map((option) => optionBuilder ? optionBuilder(option, selectedValue) : h('option', { value: option, selected: option === selectedValue, text: option }))),
   ]);
 }
 
@@ -1348,15 +2590,32 @@ function emptyState(text) {
   return h('div', { class: 'empty-state', text });
 }
 
+function inlineWarning(text, actions = []) {
+  return h('div', { class: 'inline-warning' }, [
+    h('span', { text }),
+    actions.length ? h('div', { class: 'inline-warning-actions' }, actions) : null,
+  ]);
+}
+
 function render() {
+  if (!state.mfaVerified || state.sessionLocked) {
+    app.replaceChildren(sessionGateView());
+    return;
+  }
+  if (!availableRoutes().includes(state.route)) {
+    state.route = 'dashboard';
+  }
   const views = {
     dashboard: dashboardView,
     processo: processView,
     submissao: submissionView,
     documentos: documentsView,
     mensagens: messagesView,
+    notificacoes: notificationsView,
     pendencias: pendenciesView,
     relatorios: reportsView,
+    seguranca: securityView,
+    conta: accountView,
   };
   app.replaceChildren(shell(views[state.route]()));
   restoreSearchFocus();
@@ -1376,4 +2635,6 @@ function restoreSearchFocus() {
 
 hydrateState();
 state.searchDraft = state.searchTerm;
+beginFreshSession();
+installSecurityWatchers();
 render();
