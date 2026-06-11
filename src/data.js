@@ -11,6 +11,7 @@ export const users = [
   { id: 'usr-ana', name: 'Ana Ribeiro', role: 'pesquisador', institutionalId: 'RA20260012', email: 'ana.ribeiro@instituicao.edu.br' },
   { id: 'usr-joao', name: 'João Silva', role: 'pesquisador', institutionalId: 'RA20260031', email: 'joao.silva@instituicao.edu.br' },
   { id: 'usr-marina', name: 'Marina Costa', role: 'nit', institutionalId: 'MAT-NIT-104', email: 'marina.costa@instituicao.edu.br' },
+  { id: 'usr-ricardo', name: 'Ricardo Alves', role: 'nit', institutionalId: 'MAT-NIT-117', email: 'ricardo.alves@instituicao.edu.br' },
   { id: 'usr-paulo', name: 'Paulo Mendes', role: 'coordenador', institutionalId: 'MAT-NIT-001', email: 'paulo.mendes@instituicao.edu.br' },
   { id: 'usr-livia', name: 'Lívia Fernandes', role: 'juridico', institutionalId: 'MAT-JUR-031', email: 'livia.fernandes@instituicao.edu.br' },
   { id: 'usr-carla', name: 'Carla Nogueira', role: 'secretaria', institutionalId: 'MAT-SEC-018', email: 'carla.nogueira@instituicao.edu.br' },
